@@ -2,22 +2,28 @@
 
 Contrairement au pipeline `src/routing` + `src/operation`, ce script ne découpe
 pas le problème : il envoie l'annonce BODACC brute à un LLM avec un prompt
-générique unique, et lui demande à la fois le type d'opération et tous les
+générique, et lui demande à la fois le type d'opération et tous les
 champs métier.
 
-Le modèle produit **deux lectures indépendantes** de la même annonce :
-  - `reglesMetier`     : application stricte des règles des gestionnaires,
-                         c'est cette lecture qu'on compare aux annotations ;
-  - `lectureJuridique` : lecture libre fondée sur la nature juridique des
-                         opérations, pour mesurer où les règles s'en écartent.
+Deux approches, chacune avec son propre prompt et un appel LLM séparé :
+  - `metier`    : application stricte des règles des gestionnaires
+                  (`bourrin_prompt_metier.md`) ; ce sont ces règles qui ont
+                  produit les annotations ;
+  - `juridique` : lecture fondée sur la nature juridique des opérations
+                  (`bourrin_prompt_juridique.md`), pour mesurer où les règles
+                  s'en écartent.
 
-Chaque lecture porte une **liste** d'opérations : une scission à plusieurs
-bénéficiaires en produit plusieurs, comme dans le fichier d'annotations.
+Les deux renvoient la même structure : un type et une **liste** d'opérations
+(une scission à plusieurs bénéficiaires en produit plusieurs, comme dans le
+fichier d'annotations). Le champ libre `analyse` est paramétrable (`--analyse`) :
+complète, courte ou absente — c'est l'essentiel du texte généré, donc du temps.
 
 Usage :
     uv run python bourrin.py                    # boucle interactive
     uv run python bourrin.py A20230147853       # one-shot
     uv run python bourrin.py A20230147853 --json
+    uv run python bourrin.py A20230147853 --approche juridique
+    uv run python bourrin.py A20230147853 --analyse courte   # analyse en 2-3 phrases
     uv run python bourrin.py A20230147853 --no-reasoning   # sans raisonnement du modèle
 """
 from __future__ import annotations
@@ -48,20 +54,30 @@ from src.operation.vente import _eur_to_integer_keur
 from src.utils import annuaire, is_luhn_valid
 
 
-BOURRIN_PROMPT_VERSION = "bourrin-single-prompt-v4"
+# Approche → libellé ; chacune a son prompt `bourrin_prompt_<approche>.md`.
+APPROACHES = {
+    "metier": "règles métier",
+    "juridique": "lecture juridique",
+}
+DEFAULT_APPROACH = "metier"
+PROMPT_VERSIONS = {
+    "metier": "bourrin-metier-v2",
+    "juridique": "bourrin-juridique-v2",
+}
+
+# Mode du champ `analyse` → libellé. Il change le prompt système (format de sortie).
+ANALYSIS_MODES = {
+    "complete": "complète",
+    "courte": "courte (2-3 phrases)",
+    "aucune": "sans analyse",
+}
+DEFAULT_ANALYSIS = "complete"
 
 ANNOTATIONS_PATH = "s3://projet-citrus/data/operations_verifiees.parquet"
 DEFAULT_S3_ENDPOINT = "https://minio.lab.sspcloud.fr"
 ANNOTATION_ID_COLUMN = "ref_annonce_complet"
 
 OPERATION_CODES = ("VE", "FU", "AB", "TP", "SP", "AP", "ST", "LG")
-
-# Les deux lectures demandées au modèle : clé JSON, libellé, rôle.
-READINGS = (
-    ("reglesMetier", "règles métier"),
-    ("lectureJuridique", "lecture juridique"),
-)
-COMPARED_READING = "reglesMetier"
 
 BUSINESS_FIELDS = (
     "anneeCampagne",
@@ -93,14 +109,106 @@ _DATE_INPUT_FORMATS = (
     "%Y/%m/%d",
 )
 
-# Prompt système versionné à part, à la racine du repo, pour rester lisible.
-# Les retours à la ligne du fichier sont envoyés tels quels au LLM.
-PROMPT_PATH = Path(__file__).resolve().with_name("bourrin_prompt.md")
-SYSTEM_PROMPT = PROMPT_PATH.read_text(encoding="utf-8").strip()
+# Gabarits de prompt système versionnés à part, à la racine du repo, pour rester
+# lisibles. Les retours à la ligne des fichiers sont envoyés tels quels au LLM.
+# Le corps des gabarits ne cite jamais `analyse` : tout ce qui le concerne passe
+# par les emplacements {{ANALYSE_JSON}} (exemple JSON) et {{ANALYSE_REGLES}}
+# (règles de sortie), remplis selon le mode.
+PROMPT_DIR = Path(__file__).resolve().parent
+_PROMPT_TEMPLATES = {
+    approach: (PROMPT_DIR / f"bourrin_prompt_{approach}.md")
+    .read_text(encoding="utf-8")
+    .strip()
+    for approach in APPROACHES
+}
+
+_ANALYSIS_JSON = ',\n  "analyse": "..."'
+
+# Ce que les deux approches demandent d'expliquer en plus de leur propre démarche.
+_COMPLETE_EXTRAS = """\
+  Signale en particulier :
+  le motif du rejet quand `retenu` vaut false,
+  un cas presque réuni auquel il manque un élément, et le choix de "UNKNOWN" qui en découle,
+  un montant de secours (par exemple la prime de fusion faute de mieux),
+  et chaque champ laissé à null."""
+
+ANALYSIS_RULES: dict[str, dict[str, str]] = {
+    "complete": {
+        "metier": f"""\
+- `analyse` est rédigée en français et explique, étape par étape :
+  le flux identifié (RCS-A ou RCS-B),
+  pourquoi ce type a été retenu et quels cas ont été écartés,
+  comment chaque champ a été extrait (quelle règle de priorité a joué, quelle ancre textuelle),
+  et toute incertitude.
+{_COMPLETE_EXTRAS}""",
+        "juridique": f"""\
+- `analyse` est rédigée en français et explique, étape par étape :
+  le flux identifié (RCS-A ou RCS-B),
+  quels éléments du texte établissent la nature juridique de l'opération
+  et pourquoi les types voisins (§3) ont été écartés,
+  comment chaque champ a été extrait (quelle ancre textuelle),
+  et toute incertitude.
+{_COMPLETE_EXTRAS}""",
+    },
+    "courte": dict.fromkeys(
+        APPROACHES,
+        """\
+- `analyse` tient en 2 à 3 phrases au maximum, en français :
+  le type retenu et l'indice décisif du texte,
+  puis la principale incertitude s'il y en a une
+  (motif du rejet, champ manquant, montant de secours).
+  Pas de récapitulatif champ par champ.""",
+    ),
+    "aucune": dict.fromkeys(
+        APPROACHES,
+        """\
+- Ne produis aucun champ `analyse` ni aucun texte d'explication :
+  uniquement les champs de l'exemple ci-dessus.""",
+    ),
+}
 
 
-def build_bourrin_messages(payload: dict[str, Any]) -> list[dict[str, str]]:
-    """Construire l'unique paire de messages envoyée au LLM."""
+def _check_approach(approach: str) -> str:
+    if approach not in APPROACHES:
+        raise ValueError(
+            f"approche inconnue : {approach!r} (attendues : {', '.join(APPROACHES)})"
+        )
+    return approach
+
+
+def _check_analysis(analysis: str) -> str:
+    if analysis not in ANALYSIS_MODES:
+        raise ValueError(
+            f"mode d'analyse inconnu : {analysis!r} "
+            f"(attendus : {', '.join(ANALYSIS_MODES)})"
+        )
+    return analysis
+
+
+def system_prompt(
+    approach: str = DEFAULT_APPROACH, analysis: str = DEFAULT_ANALYSIS
+) -> str:
+    """Prompt système d'une approche, avec les consignes du mode d'analyse."""
+
+    prompt = (
+        _PROMPT_TEMPLATES[_check_approach(approach)]
+        .replace(
+            "{{ANALYSE_JSON}}",
+            "" if _check_analysis(analysis) == "aucune" else _ANALYSIS_JSON,
+        )
+        .replace("{{ANALYSE_REGLES}}", ANALYSIS_RULES[analysis][approach])
+    )
+    if "{{" in prompt:
+        raise ValueError(f"emplacement non rempli dans le prompt {approach!r}")
+    return prompt
+
+
+def build_bourrin_messages(
+    payload: dict[str, Any],
+    approach: str = DEFAULT_APPROACH,
+    analysis: str = DEFAULT_ANALYSIS,
+) -> list[dict[str, str]]:
+    """Construire l'unique paire de messages envoyée au LLM pour cette approche."""
 
     compact_payload = json.dumps(
         payload, ensure_ascii=False, sort_keys=True, default=str
@@ -110,7 +218,7 @@ def build_bourrin_messages(payload: dict[str, Any]) -> list[dict[str, str]]:
         f"{compact_payload}"
     )
     return [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": system_prompt(approach, analysis)},
         {"role": "user", "content": user},
     ]
 
@@ -271,22 +379,25 @@ def _normalized_reading(
 
 
 def normalize_answer(
-    answer: dict[str, Any], payload: dict[str, Any]
+    answer: dict[str, Any],
+    payload: dict[str, Any],
+    approach: str = DEFAULT_APPROACH,
 ) -> tuple[dict[str, Any], list[str]]:
-    """Ramener la réponse libre du LLM à l'enveloppe normalisée à deux lectures."""
+    """Ramener la réponse libre du LLM à l'enveloppe normalisée, à une lecture."""
 
     warnings: list[str] = []
     if not answer:
         warnings.append("réponse LLM vide ou non analysable en JSON")
+    reading = _normalized_reading(answer, payload, warnings, APPROACHES[approach])
     envelope: dict[str, Any] = {
         "id": answer.get("id") or payload.get("id"),
+        "approche": approach,
+        **reading,
         "analyse": answer.get("analyse") or None,
     }
-    for key, label in READINGS:
-        envelope[key] = _normalized_reading(answer.get(key), payload, warnings, label)
 
     retenu = answer.get("retenu")
-    has_operations = any(envelope[key]["operations"] for key, _ in READINGS)
+    has_operations = bool(envelope["operations"])
     if not isinstance(retenu, bool):
         if answer:
             warnings.append("champ « retenu » absent : déduit de la présence d'opérations")
@@ -481,30 +592,37 @@ def format_comparison(
 def run_bourrin(
     annonce_id: str,
     *,
+    approach: str = DEFAULT_APPROACH,
+    analysis: str = DEFAULT_ANALYSIS,
     fetch: Callable[[str], dict[str, Any]] | None = None,
     ask_fn: Callable[..., str] | None = None,
     **ask_options: Any,
 ) -> dict[str, Any]:
-    """Enchaîner fetch BODACC → appel LLM unique → normalisation."""
+    """Enchaîner fetch BODACC → appel LLM unique (prompt de l'approche) → normalisation."""
 
+    _check_approach(approach)
+    _check_analysis(analysis)
     fetch = fetch or bodacc_api().fetch_annonce_json
     ask_fn = ask_fn or ask
 
     payload = _expand_payload(dict(fetch(annonce_id)))
-    messages = build_bourrin_messages(payload)
+    messages = build_bourrin_messages(payload, approach, analysis)
     started = time.monotonic()
     raw_answer = ask_fn(messages, **ask_options)
     elapsed = time.monotonic() - started
     answer = parse_json_answer(raw_answer)
     if not answer:
         logger.warning("Réponse LLM non exploitable pour %s", annonce_id)
-    envelope, warnings = normalize_answer(answer, payload)
-    compared = envelope[COMPARED_READING]["operations"]
+    envelope, warnings = normalize_answer(answer, payload, approach)
+    operations = envelope["operations"]
     return {
         "annonce_id": annonce_id,
+        "approche": approach,
+        "prompt_version": PROMPT_VERSIONS[approach],
+        "analyse_mode": analysis,
         "envelope": envelope,
-        # Raccourci de confort : première opération de la lecture comparée.
-        "prediction": compared[0] if compared else None,
+        # Raccourci de confort : première opération prédite.
+        "prediction": operations[0] if operations else None,
         "warnings": warnings,
         "elapsed_seconds": round(elapsed, 2),
         "payload": payload,
@@ -528,37 +646,16 @@ def format_result(result: dict[str, Any]) -> str:
     """Rendu lisible d'un résultat pour la session interactive."""
 
     envelope = result["envelope"]
-    lines = [f"  {'retenu':<26} {'oui' if envelope['retenu'] else 'non'}"]
-    for key, label in READINGS:
-        reading = envelope[key]
-        code = reading["codeTypeOperation"] or "—"
-        lines.append(
-            f"  {label:<26} {code:<9} {len(reading['operations'])} opération(s)"
-        )
-
-    compared = envelope[COMPARED_READING]
-    other_key, other_label = READINGS[1]
-    other = envelope[other_key]
-    divergent = (
-        compared["codeTypeOperation"] != other["codeTypeOperation"]
-        or compared["operations"] != other["operations"]
-    )
-    if compared["codeTypeOperation"] != other["codeTypeOperation"]:
-        lines.append("  ⚠ les deux lectures divergent sur le type")
-
-    for index, operation in enumerate(compared["operations"], 1):
-        lines.append(
-            f"  · {READINGS[0][1]} — opération {index}/{len(compared['operations'])}"
-        )
+    label = APPROACHES.get(envelope.get("approche"), "?")
+    operations = envelope["operations"]
+    code = envelope["codeTypeOperation"] or "—"
+    lines = [
+        f"  {'retenu':<26} {'oui' if envelope['retenu'] else 'non'}",
+        f"  {label:<26} {code:<9} {len(operations)} opération(s)",
+    ]
+    for index, operation in enumerate(operations, 1):
+        lines.append(f"  · opération {index}/{len(operations)}")
         lines.extend(_format_operation(operation))
-    if not divergent:
-        lines.append(f"  · {other_label} — identique")
-    else:
-        for index, operation in enumerate(other["operations"], 1):
-            lines.append(
-                f"  · {other_label} — opération {index}/{len(other['operations'])}"
-            )
-            lines.extend(_format_operation(operation))
 
     if envelope.get("analyse"):
         lines.append("  · analyse")
@@ -632,12 +729,17 @@ def reasoning_label(ask_options: dict[str, Any]) -> str:
 
 
 def run_interactive(
-    annotations: pl.DataFrame | None = None, **ask_options: Any
+    annotations: pl.DataFrame | None = None,
+    approach: str = DEFAULT_APPROACH,
+    analysis: str = DEFAULT_ANALYSIS,
+    **ask_options: Any,
 ) -> int:
     """Boucle interactive : un identifiant d'annonce par ligne."""
 
     print(
-        f"citrus bourrin — prompt {BOURRIN_PROMPT_VERSION}, modèle {get_model_name()}, "
+        f"citrus bourrin — approche {APPROACHES[approach]}, "
+        f"prompt {PROMPT_VERSIONS[approach]}, analyse {ANALYSIS_MODES[analysis]}, "
+        f"modèle {get_model_name()}, "
         f"raisonnement {reasoning_label(ask_options)}"
     )
     if annotations is not None:
@@ -703,7 +805,9 @@ def run_interactive(
             print(f"  commande inconnue : {entry}")
             continue
         try:
-            last = run_bourrin(entry, **ask_options)
+            last = run_bourrin(
+                entry, approach=approach, analysis=analysis, **ask_options
+            )
         except BodaccFetchError as error:
             print(f"  ✗ BODACC [{error.code}] {error.detail}")
             continue
@@ -715,7 +819,7 @@ def run_interactive(
         if referenced:
             print(
                 format_comparison(
-                    last["envelope"][COMPARED_READING]["operations"], referenced
+                    last["envelope"]["operations"], referenced
                 )
             )
 
@@ -730,6 +834,21 @@ def build_argument_parser() -> argparse.ArgumentParser:
         "annonce_ids",
         nargs="*",
         help="identifiants BODACC à traiter ; aucun = session interactive",
+    )
+    parser.add_argument(
+        "--approche",
+        choices=tuple(APPROACHES),
+        default=DEFAULT_APPROACH,
+        help=f"prompt à utiliser (défaut : {DEFAULT_APPROACH})",
+    )
+    parser.add_argument(
+        "--analyse",
+        choices=tuple(ANALYSIS_MODES),
+        default=DEFAULT_ANALYSIS,
+        help=(
+            "champ d'explication demandé au modèle : complete, courte (2-3 phrases) "
+            f"ou aucune — moins de texte, réponse plus rapide (défaut : {DEFAULT_ANALYSIS})"
+        ),
     )
     parser.add_argument(
         "--json",
@@ -779,12 +898,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
 
     if not args.annonce_ids:
-        return run_interactive(annotations, **ask_options)
+        return run_interactive(
+            annotations, args.approche, args.analyse, **ask_options
+        )
 
     status = 0
     for annonce_id in args.annonce_ids:
         try:
-            result = run_bourrin(annonce_id, **ask_options)
+            result = run_bourrin(
+                annonce_id,
+                approach=args.approche,
+                analysis=args.analyse,
+                **ask_options,
+            )
         except BodaccFetchError as error:
             print(f"✗ {annonce_id} : BODACC [{error.code}] {error.detail}", file=sys.stderr)
             status = 1
@@ -798,7 +924,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if referenced:
             print(
                 format_comparison(
-                    result["envelope"][COMPARED_READING]["operations"], referenced
+                    result["envelope"]["operations"], referenced
                 )
             )
     return status

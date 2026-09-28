@@ -2,7 +2,8 @@
 
 Tire un échantillon (ou la totalité) des opérations du fichier d'annotations,
 éventuellement filtrées sur le type annoté, envoie chaque annonce à
-`bourrin.run_bourrin`, puis affiche les métriques principales et ouvre une
+`bourrin.run_bourrin` avec le prompt de l'approche choisie (`--approche`,
+`metier` par défaut, ou `juridique`), puis affiche les métriques principales et ouvre une
 session pour examiner les résultats opération par opération.
 
 Chaque résultat est écrit dès qu'il arrive dans
@@ -14,6 +15,9 @@ Usage :
     uv run python explorer_batch.py --types VE LG -n 50      # filtrer sur le type annoté
     uv run python explorer_batch.py --types FUSION --per-type -n 5   # 5 par type de fusion
     uv run python explorer_batch.py --types TP --all         # toutes les opérations TP
+    uv run python explorer_batch.py --approche juridique     # prompt de lecture juridique
+    uv run python explorer_batch.py --analyse courte         # analyse en 2-3 phrases (plus rapide)
+    uv run python explorer_batch.py --analyse aucune         # pas d'analyse (le plus rapide)
     uv run python explorer_batch.py --no-reasoning           # sans raisonnement du modèle
     uv run python explorer_batch.py --load artifacts/bourrin_batch/<horodatage>
 
@@ -43,12 +47,14 @@ import polars as pl
 from bourrin import (
     _ANNOTATION_COLUMNS,
     ANNOTATION_ID_COLUMN,
+    ANALYSIS_MODES,
     ANNOTATIONS_PATH,
-    BOURRIN_PROMPT_VERSION,
+    APPROACHES,
     COMPARED_FIELDS,
-    COMPARED_READING,
+    DEFAULT_ANALYSIS,
+    DEFAULT_APPROACH,
     OPERATION_CODES,
-    READINGS,
+    PROMPT_VERSIONS,
     _pair_operations,
     _reference_value,
     format_annonce,
@@ -184,6 +190,8 @@ def run_one(
     annonce_id: str,
     references: list[dict[str, Any]],
     *,
+    approach: str = DEFAULT_APPROACH,
+    analysis: str = DEFAULT_ANALYSIS,
     fetch: Callable[[str], dict[str, Any]] | None = None,
     ask_fn: Callable[..., str] | None = None,
     **ask_options: Any,
@@ -198,7 +206,14 @@ def run_one(
         "result": None,
     }
     try:
-        result = run_bourrin(annonce_id, fetch=fetch, ask_fn=ask_fn, **ask_options)
+        result = run_bourrin(
+            annonce_id,
+            approach=approach,
+            analysis=analysis,
+            fetch=fetch,
+            ask_fn=ask_fn,
+            **ask_options,
+        )
     except BodaccFetchError as error:
         record.update(statut="erreur BODACC", erreur=f"[{error.code}] {error.detail}")
     except Exception as error:  # noqa: BLE001 - une annonce en échec n'arrête pas le batch
@@ -215,7 +230,7 @@ def _progress_line(done: int, total: int, record: dict[str, Any]) -> str:
     if record["result"] is None:
         return f"{prefix} ✗ {record['statut']} : {record['erreur']}"
     annotated = record["references"][0]["type_op"] if record["references"] else "?"
-    predicted = _predicted_type(record["result"]["envelope"], COMPARED_READING)
+    predicted = _predicted_type(record["result"]["envelope"])
     mark = "✓" if predicted == annotated else "✗"
     return (
         f"{prefix} {mark} annoté {annotated:<3} prédit {predicted:<10}"
@@ -227,6 +242,8 @@ def run_batch(
     annonce_ids: Sequence[str],
     annotations: pl.DataFrame,
     *,
+    approach: str = DEFAULT_APPROACH,
+    analysis: str = DEFAULT_ANALYSIS,
     workers: int = DEFAULT_WORKERS,
     output_dir: Path | None = None,
     fetch: Callable[[str], dict[str, Any]] | None = None,
@@ -252,6 +269,8 @@ def run_batch(
             run_one,
             annonce_id,
             reference_rows(annotations, annonce_id),
+            approach=approach,
+            analysis=analysis,
             fetch=fetch,
             ask_fn=ask_fn,
             **ask_options,
@@ -308,10 +327,10 @@ def load_batch(directory: str | Path) -> tuple[dict[str, Any], list[dict[str, An
 # --------------------------------------------------------------------------
 
 
-def _predicted_type(envelope: dict[str, Any], reading: str) -> str:
+def _predicted_type(envelope: dict[str, Any]) -> str:
     if not envelope["retenu"]:
         return NON_RETENU
-    return envelope[reading]["codeTypeOperation"] or SANS_TYPE
+    return envelope["codeTypeOperation"] or SANS_TYPE
 
 
 def _amount_close(expected: int | None, obtained: int | None) -> bool:
@@ -373,8 +392,7 @@ ANNONCE_SCHEMA = {
     "statut": pl.String,
     "erreur": pl.String,
     "retenu": pl.Boolean,
-    "type_regles": pl.String,
-    "type_juridique": pl.String,
+    "type_predit": pl.String,
     "n_ops_annotees": pl.Int64,
     "n_ops_predites": pl.Int64,
     "reponse_vide": pl.Boolean,
@@ -387,7 +405,7 @@ ANNONCE_SCHEMA = {
 def evaluate(records: Sequence[dict[str, Any]]) -> tuple[pl.DataFrame, pl.DataFrame]:
     """Deux tables : une ligne par annonce, une ligne par opération.
 
-    Les opérations prédites (lecture règles métier) sont appariées aux lignes
+    Les opérations prédites sont appariées aux lignes
     annotées comme dans la session bourrin : par couple de SIREN, sinon par ordre.
     """
 
@@ -414,12 +432,11 @@ def evaluate(records: Sequence[dict[str, Any]]) -> tuple[pl.DataFrame, pl.DataFr
             continue
 
         envelope = result["envelope"]
-        operations = envelope[COMPARED_READING]["operations"]
+        operations = envelope["operations"]
         warnings = result["warnings"]
         row.update(
             retenu=envelope["retenu"],
-            type_regles=_predicted_type(envelope, COMPARED_READING),
-            type_juridique=_predicted_type(envelope, READINGS[1][0]),
+            type_predit=_predicted_type(envelope),
             n_ops_predites=len(operations),
             reponse_vide=any("réponse LLM vide" in warning for warning in warnings),
             alertes=len(warnings),
@@ -464,8 +481,7 @@ def compute_metrics(annonces: pl.DataFrame, operations: pl.DataFrame) -> dict[st
                 "annonces": subset.height,
                 "ok": subset_done.height,
                 "retenu": int(subset_done["retenu"].sum()),
-                "type_ok": int((subset_done["type_regles"] == code).sum()),
-                "type_juridique_ok": int((subset_done["type_juridique"] == code).sum()),
+                "type_ok": int((subset_done["type_predit"] == code).sum()),
                 "operations_appariees": subset_paired.height,
                 "champs": {
                     field: int(subset_paired[f"{field}_ok"].sum())
@@ -487,7 +503,7 @@ def compute_metrics(annonces: pl.DataFrame, operations: pl.DataFrame) -> dict[st
         }
 
     confusion: dict[tuple[str, str], int] = {}
-    for annotated, predicted in done.select("type_annote", "type_regles").iter_rows():
+    for annotated, predicted in done.select("type_annote", "type_predit").iter_rows():
         confusion[(annotated, predicted)] = confusion.get((annotated, predicted), 0) + 1
 
     statuts = dict(annonces.group_by("statut").len().iter_rows())
@@ -498,9 +514,7 @@ def compute_metrics(annonces: pl.DataFrame, operations: pl.DataFrame) -> dict[st
         "ok": done.height,
         "reponses_vides": int(done["reponse_vide"].sum()),
         "retenu": int(done["retenu"].sum()),
-        "type_ok": int((done["type_regles"] == done["type_annote"]).sum()),
-        "type_juridique_ok": int((done["type_juridique"] == done["type_annote"]).sum()),
-        "lectures_concordantes": int((done["type_regles"] == done["type_juridique"]).sum()),
+        "type_ok": int((done["type_predit"] == done["type_annote"]).sum()),
         "nombre_operations_ok": int(
             (done["n_ops_predites"] == done["n_ops_annotees"]).sum()
         ),
@@ -559,9 +573,12 @@ def format_confusion(confusion: dict[tuple[str, str], int]) -> str:
 def format_metrics(metrics: dict[str, Any], meta: dict[str, Any] | None = None) -> str:
     meta = meta or {}
     ok = metrics["ok"]
+    label = APPROACHES.get(meta.get("approche"), "?")
     lines = [
         "═" * 78,
-        f"  Batch bourrin — prompt {meta.get('prompt_version', '?')}"
+        f"  Batch bourrin — approche {label}"
+        f", prompt {meta.get('prompt_version', '?')}"
+        f", analyse {ANALYSIS_MODES.get(meta.get('analyse'), '?')}"
         f", modèle {meta.get('modele', '?')}"
         f", raisonnement {meta.get('raisonnement', '?')}",
     ]
@@ -574,6 +591,7 @@ def format_metrics(metrics: dict[str, Any], meta: dict[str, Any] | None = None) 
             + f", graine {meta.get('seed')}"
         )
         lines.append(f"  types {', '.join(meta['types'])} — {sampling}")
+    lines.append("  (référence : annotations, produites selon les règles métier)")
     lines.append("═" * 78)
 
     statuts = ", ".join(f"{name} {count}" for name, count in sorted(metrics["statuts"].items()))
@@ -592,24 +610,21 @@ def format_metrics(metrics: dict[str, Any], meta: dict[str, Any] | None = None) 
         "",
         "  Sur les annonces traitées :",
         f"  Retenue comme restructuration  {_ratio(metrics['retenu'], ok)}",
-        f"  Type exact (règles métier)     {_ratio(metrics['type_ok'], ok)}",
-        f"  Type exact (lecture juridique) {_ratio(metrics['type_juridique_ok'], ok)}",
-        f"  Les deux lectures concordent   {_ratio(metrics['lectures_concordantes'], ok)}",
+        f"  Type exact                     {_ratio(metrics['type_ok'], ok)}",
         f"  Nombre d'opérations exact      {_ratio(metrics['nombre_operations_ok'], ok)}",
         f"  Alertes Luhn sur un SIREN      {metrics['alertes_luhn']}"
         f"  ({metrics['annonces_avec_alertes']} annonce(s) avec avertissements)",
         "",
-        "  Par type annoté        n  retenu   type ok   type jur.",
+        "  Par type annoté        n  retenu   type ok",
     ]
     for row in metrics["par_type"]:
         lines.append(
             f"  {row['type']:<16} {row['annonces']:>5}"
             f"  {_rate(row['retenu'], row['ok']):>6}"
             f"  {_rate(row['type_ok'], row['ok']):>8}"
-            f"  {_rate(row['type_juridique_ok'], row['ok']):>9}"
         )
 
-    lines += ["", "  Matrice de confusion (règles métier)", format_confusion(metrics["confusion"])]
+    lines += ["", f"  Matrice de confusion ({label})", format_confusion(metrics["confusion"])]
 
     paired = metrics["operations_appariees"]
     op_statuts = ", ".join(
@@ -733,7 +748,7 @@ def format_detail(record: dict[str, Any], n: int | None = None) -> str:
         lines.append(f"  {result['payload']['url_complete']}")
     lines.append(format_result(result))
     lines.append(
-        format_comparison(result["envelope"][COMPARED_READING]["operations"], record["references"])
+        format_comparison(result["envelope"]["operations"], record["references"])
     )
     return "\n".join(lines)
 
@@ -825,6 +840,22 @@ def build_argument_parser() -> argparse.ArgumentParser:
         "--seed", type=int, default=DEFAULT_SEED, help=f"graine du tirage (défaut : {DEFAULT_SEED})"
     )
     parser.add_argument(
+        "--approche",
+        choices=tuple(APPROACHES),
+        default=DEFAULT_APPROACH,
+        help=f"prompt à utiliser : règles métier ou lecture juridique (défaut : {DEFAULT_APPROACH})",
+    )
+    parser.add_argument(
+        "--analyse",
+        choices=tuple(ANALYSIS_MODES),
+        default=DEFAULT_ANALYSIS,
+        help=(
+            "champ d'explication demandé au modèle : complete (étape par étape), "
+            "courte (2-3 phrases) ou aucune ; moins de texte = réponse plus rapide, "
+            f"mais moins de matière pour comprendre les erreurs (défaut : {DEFAULT_ANALYSIS})"
+        ),
+    )
+    parser.add_argument(
         "--workers",
         type=int,
         default=DEFAULT_WORKERS,
@@ -901,7 +932,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             ask_options["reasoning"] = False
         print(
             f"{len(annonce_ids)} annonce(s) — types {', '.join(types)} — "
-            f"prompt {BOURRIN_PROMPT_VERSION}, modèle {get_model_name()}, "
+            f"approche {APPROACHES[args.approche]}, "
+            f"prompt {PROMPT_VERSIONS[args.approche]}, "
+            f"analyse {ANALYSIS_MODES[args.analyse]}, modèle {get_model_name()}, "
             f"raisonnement {reasoning_label(ask_options)}, "
             f"{args.workers} appel(s) simultané(s)\nrésultats : {output_dir}"
         )
@@ -911,7 +944,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         meta = {
             "date": datetime.now().isoformat(timespec="seconds"),
-            "prompt_version": BOURRIN_PROMPT_VERSION,
+            "approche": args.approche,
+            "prompt_version": PROMPT_VERSIONS[args.approche],
+            "analyse": args.analyse,
             "modele": get_model_name(),
             "raisonnement": reasoning_label(ask_options),
             "annotations": str(args.annotations),
@@ -928,6 +963,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         records = run_batch(
             annonce_ids,
             annotations,
+            approach=args.approche,
+            analysis=args.analyse,
             workers=args.workers,
             output_dir=output_dir,
             **ask_options,

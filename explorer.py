@@ -15,7 +15,6 @@ from dotenv import load_dotenv
 load_dotenv(override=True)
 
 from bourrin import (
-    COMPARED_READING,
     afficher_annonce,
     annotation_for,
     format_annonce,
@@ -34,9 +33,13 @@ print(describe_annotations(annotations))
 # %% l'annonce étudiée — la changer ici, puis réexécuter les cellules suivantes
 ANNONCE_ID = "A20240102873"
 RAISONNEMENT = True  # False : le modèle répond sans raisonner (plus rapide)
+APPROCHE = "metier"  # ou "juridique" : chaque approche a son propre prompt
+ANALYSE = "complete"  # "courte" (2-3 phrases) ou "aucune" : réponse plus rapide
 
 # %% une annonce de bout en bout
-res = run_bourrin(ANNONCE_ID, reasoning=RAISONNEMENT)
+res = run_bourrin(
+    ANNONCE_ID, approach=APPROCHE, analysis=ANALYSE, reasoning=RAISONNEMENT
+)
 print(format_result(res))
 
 # %% la réponse normalisée, et le raccourci de confort
@@ -46,7 +49,7 @@ pprint(res["payload"])
 
 # %% confronter à la référence annotée
 print(format_comparison(
-    res["envelope"][COMPARED_READING]["operations"],
+    res["envelope"]["operations"],
     annotation_for(annotations, ANNONCE_ID),
 ))
 

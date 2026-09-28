@@ -1,3 +1,5 @@
+import contextlib
+import io
 import json
 import tempfile
 import unittest
@@ -6,8 +8,10 @@ from pathlib import Path
 
 import polars as pl
 
+from bourrin import APPROACHES, ANALYSIS_MODES, system_prompt
 from explorer_batch import (
     FUSION_FAMILY,
+    build_argument_parser,
     compute_metrics,
     evaluate,
     filter_operations,
@@ -52,9 +56,8 @@ def annotations_frame():
 
 
 def llm_answer(code, operations, retenu=True):
-    reading = {"codeTypeOperation": code, "operations": operations}
     return json.dumps(
-        {"retenu": retenu, "reglesMetier": reading, "lectureJuridique": reading}
+        {"retenu": retenu, "codeTypeOperation": code, "operations": operations}
     )
 
 
@@ -206,6 +209,70 @@ class BatchTest(unittest.TestCase):
         )
         self.assertEqual(seen, [{"reasoning": False}])
 
+    def test_approach_selects_its_own_prompt(self):
+        seen = []
+
+        def recording_ask(messages, **options):
+            seen.append((messages[0]["content"], options))
+            return fake_ask(messages)
+
+        records = run_batch(
+            ["A1"],
+            self.annotations,
+            approach="juridique",
+            fetch=fake_fetch,
+            ask_fn=recording_ask,
+            progress=lambda line: None,
+        )
+        self.assertEqual(seen, [(system_prompt("juridique", "complete"), {})])
+        self.assertNotEqual(system_prompt("juridique"), system_prompt("metier"))
+        result = records[0]["result"]
+        self.assertEqual(result["envelope"]["approche"], "juridique")
+        self.assertEqual(result["prompt_version"], "bourrin-juridique-v2")
+
+    def test_analysis_modes_change_the_output_format(self):
+        for approach in APPROACHES:
+            prompts = {mode: system_prompt(approach, mode) for mode in ANALYSIS_MODES}
+            self.assertEqual(len(set(prompts.values())), 3)
+            for mode, prompt in prompts.items():
+                self.assertNotIn("{{", prompt)
+                self.assertEqual('"analyse":' in prompt, mode != "aucune", (approach, mode))
+            self.assertIn("2 à 3 phrases", prompts["courte"])
+        with self.assertRaises(ValueError):
+            system_prompt("metier", "longue")
+
+    def test_analysis_mode_reaches_the_prompt_not_the_llm_options(self):
+        seen = []
+
+        def recording_ask(messages, **options):
+            seen.append((messages[0]["content"], options))
+            return fake_ask(messages)
+
+        records = run_batch(
+            ["A1"],
+            self.annotations,
+            analysis="aucune",
+            fetch=fake_fetch,
+            ask_fn=recording_ask,
+            progress=lambda line: None,
+        )
+        self.assertEqual(seen, [(system_prompt("metier", "aucune"), {})])
+        result = records[0]["result"]
+        self.assertEqual(result["analyse_mode"], "aucune")
+        self.assertIsNone(result["envelope"]["analyse"])
+
+    def test_default_approach_is_metier(self):
+        self.assertTrue(all(r["result"]["approche"] == "metier" for r in self.records if r["result"]))
+        self.assertEqual(build_argument_parser().parse_args([]).approche, "metier")
+        self.assertEqual(build_argument_parser().parse_args([]).analyse, "complete")
+        self.assertEqual(
+            build_argument_parser().parse_args(["--analyse", "courte"]).analyse, "courte"
+        )
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            build_argument_parser().parse_args(["--approche", "autre"])
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            build_argument_parser().parse_args(["--analyse", "longue"])
+
     def test_filters_and_rendering(self):
         self.assertEqual(filter_operations(self.operations, ["VE"]).height, 2)
         self.assertEqual(filter_operations(self.operations, ["type"]).height, 1)
@@ -215,6 +282,9 @@ class BatchTest(unittest.TestCase):
             filter_operations(self.operations, ["nimporte"])
         self.assertIn("B3", format_operation_list(self.operations))
         self.assertIn("Matrice de confusion", format_metrics(self.metrics, {}))
+        self.assertIn(
+            "lecture juridique", format_metrics(self.metrics, {"approche": "juridique"})
+        )
 
 
 if __name__ == "__main__":
