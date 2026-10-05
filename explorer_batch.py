@@ -821,7 +821,8 @@ def build_argument_parser() -> argparse.ArgumentParser:
         nargs="+",
         help="types annotés à garder (VE, LG, TP, FU, AB, SP, ST, AP, ou FUSION) ; défaut : tous",
     )
-    parser.add_argument(
+    size = parser.add_mutually_exclusive_group()
+    size.add_argument(
         "-n",
         "--sample-size",
         type=int,
@@ -833,8 +834,8 @@ def build_argument_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="appliquer --sample-size à chaque type plutôt qu'au total",
     )
-    parser.add_argument(
-        "--all", action="store_true", help="toutes les opérations, sans tirage"
+    size.add_argument(
+        "--all", action="store_true", help="toutes les opérations, sans tirage (exclut -n)"
     )
     parser.add_argument(
         "--seed", type=int, default=DEFAULT_SEED, help=f"graine du tirage (défaut : {DEFAULT_SEED})"

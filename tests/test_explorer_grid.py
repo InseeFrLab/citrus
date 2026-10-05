@@ -92,6 +92,12 @@ class GridTest(unittest.TestCase):
         self.assertTrue(parsed.no_browse and parsed.yes)
         self.assertNotIn("--no-reasoning", batch_argv(with_reasoning, [], Path("x")))
 
+    def test_all_and_sample_size_are_exclusive(self):
+        for parser in (build_argument_parser(), batch_parser()):
+            with self.assertRaises(SystemExit), mock.patch("sys.stderr"):
+                parser.parse_args(["--all", "-n", "300"])
+            self.assertTrue(parser.parse_args(["--all"]).all)
+
 
 class MetricsTest(unittest.TestCase):
     def setUp(self):

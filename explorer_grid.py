@@ -334,12 +334,13 @@ def build_argument_parser() -> argparse.ArgumentParser:
     )
     selection = parser.add_argument_group("échantillon (commun à toute la grille)")
     selection.add_argument("--types", nargs="+", help="types annotés à garder ; défaut : tous")
-    selection.add_argument(
+    size = selection.add_mutually_exclusive_group()
+    size.add_argument(
         "-n", "--sample-size", type=int, default=DEFAULT_SAMPLE_SIZE,
         help=f"nombre d'opérations tirées (défaut : {DEFAULT_SAMPLE_SIZE})",
     )
     selection.add_argument("--per-type", action="store_true", help="--sample-size par type")
-    selection.add_argument("--all", action="store_true", help="toutes les opérations, sans tirage")
+    size.add_argument("--all", action="store_true", help="toutes les opérations, sans tirage (exclut -n)")
     selection.add_argument("--seed", type=int, default=DEFAULT_SEED, help="graine du tirage")
     selection.add_argument("--annotations", default=ANNOTATIONS_PATH, help="fichier d'annotations")
     selection.add_argument(
