@@ -1,6 +1,6 @@
 """Approche « bourrin » : un seul LLM, un seul prompt, routage + extraction.
 
-Contrairement au pipeline `src/routing` + `src/operation`, ce script ne découpe
+Contrairement au pipeline découpé archivé dans `old/src/routing` + `old/src/operation`, ce script ne découpe
 pas le problème : il envoie l'annonce BODACC brute à un LLM avec un prompt
 générique, et lui demande à la fois le type d'opération et tous les
 champs métier.
@@ -37,6 +37,7 @@ import textwrap
 import time
 from collections.abc import Callable, Sequence
 from datetime import date, datetime
+from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
 from typing import Any
 
@@ -50,7 +51,6 @@ from src import logger
 from src.bodacc.api import BodaccFetchError, bodacc_api
 from src.bodacc import normalize_bodacc_announcement
 from src.llm.client import ask, get_model_name, parse_json_answer
-from src.operation.vente import _eur_to_integer_keur
 from src.utils import annuaire, is_luhn_valid
 
 
@@ -226,8 +226,9 @@ def build_bourrin_messages(
 def _expand_payload(payload: dict[str, Any]) -> dict[str, Any]:
     """Déplier les balises BODACC stockées sous forme de chaîne JSON.
 
-    Remplace `src.bodacc.api._clean_json`, qui suppose la présence des balises
-    de vente et lève une TypeError sur les sept autres types d'opération.
+    Remplace l'ancien `_clean_json` (archivé dans `old/src/bodacc/api.py`), qui
+    suppose la présence des balises de vente et lève une TypeError sur les sept
+    autres types d'opération.
     """
 
     expanded = dict(payload)
@@ -268,6 +269,13 @@ def _normalized_date(value: Any, warnings: list[str], field: str) -> str | None:
             continue
     warnings.append(f"{field} n'est pas une date reconnue : {value!r}")
     return None
+
+
+def _eur_to_integer_keur(amount: Any) -> int:
+    """Apply the legacy evaluator's half-away-from-zero EUR to kEUR conversion."""
+    return int((Decimal(str(amount)) / Decimal(1000)).quantize(
+        Decimal("1"), rounding=ROUND_HALF_UP
+    ))
 
 
 def _normalized_amount(value: Any, warnings: list[str], field: str) -> int | None:

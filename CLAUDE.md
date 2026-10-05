@@ -10,20 +10,16 @@ operation types an announcement is (`VE`, `FU`, `AB`, `TP`, `SP`, `AP`, `ST`, `L
 business fields it carries — above all the SIREN of the transferor (*cédant*) and of the
 beneficiary.
 
-The two halves have different coverage, and are **not yet wired together**:
+The active approach is "bourrin": one generic prompt, one LLM call doing classification *and*
+extraction, for all eight types (`bourrin.py` and the `explorer*.py` scripts around it).
 
-- **Classification** (`src/routing`) handles all eight types.
-- **Extraction** (`src/operation`) has skills for `VE`, `LG` and `TP` only; nothing extracts
-  fields for the fusion family (`FU`, `AB`, `SP`, `AP`, `ST`).
-- No code path runs router → skill end to end. `oracle_benchmark` selects the skill from the
-  *annotated* `type_op`, and the routing benchmarks run classification without extraction; tests
-  assert this separation (e.g.
-  `RoutingTest.test_router_has_no_operation_skill_dependency_or_dispatch` in `tests/test_routing.py`).
-
-Note: `README.md` predates the routing/benchmark layer. It still calls classification
-unimplemented and lists `TP`/`LG` among the missing parsers; both are outdated. `main.py` is the
-legacy `VE`-only S3 path and touches neither `src/routing` nor `src/operation` — the current
-entry points are the four `src/modele/*_benchmark.py` runners.
+**`old/` is a frozen archive** of everything earlier that bourrin does not use: the legacy
+`VE`-only S3 evaluation (`main.py`, `modele/evaluate.py`, `metrics.py`) and the decomposed
+pipeline (LLM routing `src/routing`, per-type extraction `src/operation`, the four
+`src/modele/*_benchmark.py` runners), plus their tests and full pre-trim copies of
+`src/bodacc/api.py` and `src/utils.py`. Its `src.*` imports were not rewritten, so nothing in
+`old/` runs as is, and `unittest discover -s tests` does not see `old/tests/`. Do not import from
+or edit `old/` unless asked; read it for prior art (e.g. the fusion reconciliation logic).
 
 ## Commands
 
@@ -37,22 +33,12 @@ Tests are plain `unittest` (no pytest), fully offline — LLM calls and BODACC f
 injected fakes:
 
 ```bash
-uv run python -m unittest discover -s tests -t .        # whole suite (~240 tests, ~2 s)
-uv run python -m unittest tests.test_routing            # one module
-uv run python -m unittest tests.test_routing.RoutingTest.test_name  # one test
+uv run python -m unittest discover -s tests -t .        # whole suite (~50 tests, <1 s)
+uv run python -m unittest tests.test_explorer_batch     # one module
+uv run python -m unittest tests.test_explorer_grid.GridTest.test_name  # one test
 ```
 
 No linter, formatter or type checker is configured (none in `pyproject.toml`, no pre-commit).
-
-Benchmarks are the real-data entry points; each takes an annotations CSV/Parquet and an output
-directory, and hits both the BODACC API and the LLM lab:
-
-```bash
-uv run python -m src.modele.routing_benchmark --annotations <file> --output-dir <dir> [--max-per-type 10|all]
-uv run python -m src.modele.fusion_subtype_benchmark --annotations <file> --output-dir <dir> [--max-per-type 5|all]
-uv run python -m src.modele.fusion_reconciliation_benchmark --annotations <file> --output-dir <dir> [--max-seeds 5 | --all]
-uv run python -m src.modele.oracle_benchmark --annotations <file> --output-dir <dir> [--max-ve N] [--max-lg N] [--max-tp N] [--amount-tolerance 0.1]
-```
 
 The "bourrin" approach — one generic prompt, one LLM call doing routing *and* extraction.
 `--approche metier|juridique` (default `metier`) picks the prompt, on both `bourrin.py` and
@@ -97,7 +83,7 @@ computed on predicted/annotated operation pairs only. An operation with status `
 is an extra *predicted* operation left unmatched — the announcement itself is always annotated.
 
 `explorer_grid.py` runs the full grid (model × reasoning oui/non × analyse × approche, 36
-configurations by default; `--modeles`, `--raisonnement`, `--analyses`, `--approches` to
+configurations by default — models from `MODELS` in `explorer_grid.py`; `--modeles`, `--raisonnement`, `--analyses`, `--approches` to
 restrict; `--dry-run` lists it without any call) on one shared sample, and logs each batch as a
 nested MLflow run under a `grille-<timestamp>` parent (experiment `citrus-bourrin-grille` by
 default). It does not reimplement the batch: it calls `explorer_batch.main(argv)` per
@@ -110,24 +96,14 @@ MLflow credentials are mandatory (`MLFLOW_TRACKING_URI`, plus `MLFLOW_TRACKING_U
 
 `explorer.py` holds the `# %%` cells for driving those functions from a VS Code interactive
 window. Importing `bourrin.py` runs nothing except a REPL convenience: it `chdir`s into
-`citrus-ia-gen/` if launched from the parent directory. `test.py` is a stale scratch script
-(hardcoded `chdir` to a `citrus/` path that no longer exists) — not part of the test suite.
-
-Legacy S3-backed vente evaluation (reads/writes `s3://projet-citrus/...`):
-
-```bash
-uv run main.py
-```
-
-Call graph regeneration: `bash docs/graphs.sh` (code2flow → `docs/call_graph_all_but_test.png`).
-Despite the name, the script excludes `./src/test/*`, which does not exist, so `tests/` is
-included in the graph.
+`citrus-ia-gen/` if launched from the parent directory.
 
 ## Configuration
 
 `.env` at the repo root is loaded on `import src`. `LLM_LAB_API_KEY` is required for anything
 touching an LLM; `LLM_LAB_ENDPOINT` (default `https://llm.lab.sspcloud.fr/api`) and
-`LLM_MODEL_NAME` (default `qwen3-8-27b`) override the SSP Cloud lab defaults. Beware that
+`LLM_MODEL_NAME` (default `qwen3-8-27b`, from `DEFAULT_MODEL` in `src/llm/client.py` — the
+module docstring still says `gemma4-26b-moe`, which is stale) override the SSP Cloud lab defaults. Beware that
 the endpoint path is case-sensitive (`/api`, not `/API`) and that a wrong one surfaces as an
 opaque `405 Method Not Allowed`. Langfuse is optional: `get_client` only wraps with
 `langfuse.openai.OpenAI` when both `LANGFUSE_PUBLIC_KEY` and `LANGFUSE_SECRET_KEY` are set. S3/MinIO access uses the AWS profile
@@ -135,51 +111,21 @@ opaque `405 Method Not Allowed`. Langfuse is optional: `get_client` only wraps w
 
 ## Architecture
 
-The pipeline is layered so that each boundary can be tested and benchmarked alone.
+**Source layer — `src/`** (only what bourrin needs)
+- `src/__init__.py`: loads `.env`, configures the `citrus` logger (file + console handler).
+- `src/bodacc/api.py`: `bodacc_api.fetch_annonce_json` fetches one exact announcement and raises
+  categorized `BodaccFetchError`s.
+- `src/bodacc/normalization.py`: turns a raw payload into a frozen `NormalizedBodaccAnnouncement`
+  exposing **source facts only** — dialect (`RCS-A`/`RCS-B`), parties, descriptions, dates,
+  origin-of-funds. No role inference, date cascade or amount normalization; keep it that way.
+- `src/llm/client.py`: OpenAI-compatible client (`ask`, `ask_json`, `parse_json_answer`);
+  `reasoning=False` sends `reasoning_effort="none"`.
+- `src/utils.py`: `is_luhn_valid` (SIREN check), `annuaire` (public record URL).
 
-**1. Source normalization — `src/bodacc/`**
-`api.py` has two generations side by side: legacy `bodacc_api.get_annonce_json` (returns the
-first result, no error typing) and the evaluation-oriented `fetch_annonce_json`, which raises
-categorized `BodaccFetchError`s. `normalization.py` turns a raw payload into a frozen
-`NormalizedBodaccAnnouncement` exposing **source facts only** — dialect (`RCS-A`/`RCS-B`),
-parties, descriptions, dates, origin-of-funds. It performs no role inference, no date cascade,
-no amount normalization; that separation is deliberate and should be preserved.
-
-**2. Semantic routing — `src/routing/`**
-Two stages, both LLM-backed, both returning validated frozen dataclasses:
-
-- `router.py` (`family_router`) picks a coarse `RoutingFamily`: `VE`, `LG`, `TP`,
-  `FUSION_FAMILY` or `UNKNOWN`. `build_routing_context` projects the normalized announcement
-  into a compact deterministic JSON context (dates deliberately excluded).
-- The fusion family then has two alternative paths:
-  - `fusion_subtype.py` — single-shot LLM router straight to `FU`/`AB`/`SP`/`ST`/`AP`, plus
-    inspectable axes (transfer scope, transferor fate, beneficiary creation/count).
-  - `fusion_semantics.py` + `fusion_reconciliation.py` — the two-phase design. The LLM parses
-    one announcement into source-grounded participants and a `LegalFamily`; then
-    `build_fusion_provisional` produces a provisional record using internal states `FZ`/`SZ`,
-    and `reconcile_fusion_family` runs a **pure, offline, campaign-global** pass that resolves
-    them (an `AB` anchor propagates to `FZ` rows sharing a beneficiary SIREN; `SP` anchors
-    propagate through transferor SIRENs unless local facts conflict). Rows are grouped via
-    `description_fingerprint` (NFKC + whitespace canonicalization + SHA-256).
-
-Prompts live in dedicated `*_prompt.py` modules, are written in French, demand a single JSON
-object, and each carries a version constant (`ROUTER_PROMPT_VERSION`,
-`FUSION_SUBTYPE_PROMPT_VERSION`, `FUSION_SEMANTICS_PROMPT_VERSION`, …) alongside taxonomy
-versions. Bump these when you change a prompt or a label set — benchmark summaries record them.
-
-**3. Extraction skills — `src/operation/`**
-"Skill" here is this repo's own vocabulary for a per-operation-type extraction unit — a plain
-`Protocol` implementation, unrelated to agentic Agent Skills (`SKILL.md`), tool calling or any
-agent loop, none of which exist in this codebase. Each skill implements the `OperationSkill`
-protocol (`operation_type` + `extract(announcement)
--> OperationResult`, a fixed `TypedDict` of Citrus business fields). `vente.py` mixes structured
-JSON reads with LLM extraction for free-text amount/date; `transmission_patrimoine.py` and
-`location_gerance.py` are deterministic (regex/date parsing over normalized facts).
-
-**Alternative: the "bourrin" approach — `bourrin.py`**
-A deliberate counter-experiment to layers 2 and 3: `run_bourrin` sends the raw (dict-expanded)
-BODACC payload to a single LLM call with one generic French prompt that asks for the operation
-type *and* every business field at once.
+**The bourrin approach — `bourrin.py`**
+`run_bourrin` sends the raw BODACC payload (string-encoded JSON fields expanded by
+`_expand_payload`) to a single LLM call with one generic French prompt that asks for the
+operation type *and* every business field at once.
 
 There are two approaches, each with its own prompt and its own LLM call (split so that one call
 does not have to produce both readings). Both prompts sit at the repo root, are read verbatim
@@ -216,39 +162,18 @@ the amount is asked in EUR then converted to the kEUR contract via `_eur_to_inte
 `format_comparison` pairs predicted operations with annotated rows on the (cédant, bénéficiaire)
 couple before falling back to order. `fetch`/`ask_fn` are injectable, as elsewhere.
 
-Note `_expand_payload`: `bourrin.py` deliberately does **not** use `src.bodacc.api._clean_json`,
-which tests a hardcoded key and passes `None` to `json.loads` — it raises on 7 of the 8
-operation types, only vente payloads survive it. Do not reuse `_clean_json` outside the vente
-path.
-
-**4. Evaluation — `src/modele/`**
-`benchmark.py` is the pure offline comparator: it normalizes annotations and predictions and
-compares them field by field on `JOIN_KEY = "ref_annonce_complet"`. `bodacc_lookup.py` derives
-the exact BODACC OpenData id from annotation references and refuses to synthesize one when
-anything is ambiguous. The four runners wire fetch → route/extract → compare, write Parquet
-predictions/errors plus a `*_summary.json` (model name, prompt/taxonomy versions, git HEAD),
-and select deterministic sub-samples in stable id order. `evaluate.py` + `metrics.py` are the
-older polars/S3 vente path used by `main.py`.
-
-Annotation files are expected to carry `ref_annonce`, `numero_annonce`, `ref_annonce_complet`,
-`type_op`, `siren_cedante`, `siren_beneficiaire`, `date_effet_comptable_op`,
-`date_realisation_juridique_op`, `montant`.
+**Scripts layered on top:** `explorer.py` (VS Code cells) and `explorer_batch.py` import from
+`bourrin.py`; `explorer_grid.py` drives `explorer_batch.main`. Annotation rows are expected to
+carry `ref_annonce_complet` (join key), `type_op`, `siren_cedante`, `siren_beneficiaire`,
+`date_effet_comptable_op`, `date_realisation_juridique_op`, `montant`.
 
 ## Conventions that matter here
 
-- **Never invent a classification.** `UNKNOWN` is a first-class outcome at every routing stage;
-  ambiguous announcements must not fall back to `VE`. `fusion_reconciliation` documents a
-  historical `FU`/`ST` → `AP` fallback it explicitly does *not* implement
-  (`HISTORICAL_ISOLATED_AP_FALLBACK_IMPLEMENTED = False`) rather than guess.
-- **Reference labels stay out of the pipeline.** `type_op` is used only to build cohorts or as a
-  declared oracle (`oracle_benchmark`), and is joined back after prediction.
-- **Strict LLM output validation.** Every router parses JSON strictly (duplicate keys rejected,
-  evidence/reason length-capped) and raises typed `*LLMError` / `*OutputError` subclasses instead
-  of coercing a bad answer.
-- **Dependency injection over patching internals.** Routers and benchmark runners accept `ask`
-  functions, fetchers and skill maps as parameters — that is what keeps the whole suite offline.
-- **Two code styles coexist.** Newer modules (`bodacc/normalization`, `routing/*`, `operation/*`,
-  `modele/*benchmark*`) use `from __future__ import annotations`, frozen `slots=True` dataclasses,
-  `str`-valued `Enum`s and exhaustive docstrings; legacy modules (`bodacc/api`, `operation/vente`
-  helpers, `modele/evaluate`, `modele/metrics`, `main.py`, `test.py`) are looser. Match the style
-  of the module you are editing rather than the repo average.
+- **Never invent a classification.** Unknown or unparseable types normalize to `UNKNOWN`; do not
+  fall back to `VE`.
+- **Reference labels stay out of the prediction.** `type_op` only selects the sample and is
+  joined back for scoring.
+- **Dependency injection over patching internals.** `fetch` / `ask_fn` are parameters — that is
+  what keeps the test suite offline.
+- **Prompt versions.** Bump `PROMPT_VERSIONS` in `bourrin.py` when editing a `bourrin_prompt_*.md`
+  file; batch `meta.json` and MLflow runs record it.
