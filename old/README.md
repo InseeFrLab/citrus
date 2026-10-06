@@ -1,4 +1,4 @@
-> **Archive.** Ce dossier contient le code antérieur à l'approche « bourrin » qui n'est plus
+> **Archive.** Ce dossier contient le code antérieur à l'approche actuelle (`extract.py`) qui n'est plus
 > utilisé : l'ancienne chaîne d'évaluation des ventes (`main.py`, `src/modele/evaluate.py`,
 > `metrics.py`) et le pipeline découpé routing → extraction → benchmarks (`src/routing`,
 > `src/operation`, `src/modele/*_benchmark.py`), avec leurs tests. `src/bodacc/api.py` et

@@ -1,6 +1,13 @@
 # Docs
 *.gv
 
+# Quarto render
+*_files/
+.quarto/
+_site/
+_freeze/
+docs/*.html
+
 # Data
 data/
 artifacts/

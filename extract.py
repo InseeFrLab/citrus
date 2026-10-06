@@ -1,4 +1,4 @@
-"""Approche « bourrin » : un seul LLM, un seul prompt, routage + extraction.
+"""Extraction en un appel : un seul LLM, un seul prompt, routage + extraction.
 
 Contrairement au pipeline découpé archivé dans `old/src/routing` + `old/src/operation`, ce script ne découpe
 pas le problème : il envoie l'annonce BODACC brute à un LLM avec un prompt
@@ -7,10 +7,10 @@ champs métier.
 
 Deux approches, chacune avec son propre prompt et un appel LLM séparé :
   - `metier`    : application stricte des règles des gestionnaires
-                  (`bourrin_prompt_metier.md`) ; ce sont ces règles qui ont
+                  (`prompts/metier.md`) ; ce sont ces règles qui ont
                   produit les annotations ;
   - `juridique` : lecture fondée sur la nature juridique des opérations
-                  (`bourrin_prompt_juridique.md`), pour mesurer où les règles
+                  (`prompts/juridique.md`), pour mesurer où les règles
                   s'en écartent.
 
 Les deux renvoient la même structure : un type et une **liste** d'opérations
@@ -19,12 +19,12 @@ fichier d'annotations). Le champ libre `analyse` est paramétrable (`--analyse`)
 complète, courte ou absente — c'est l'essentiel du texte généré, donc du temps.
 
 Usage :
-    uv run python bourrin.py                    # boucle interactive
-    uv run python bourrin.py A20230147853       # one-shot
-    uv run python bourrin.py A20230147853 --json
-    uv run python bourrin.py A20230147853 --approche juridique
-    uv run python bourrin.py A20230147853 --analyse courte   # analyse en 2-3 phrases
-    uv run python bourrin.py A20230147853 --no-reasoning   # sans raisonnement du modèle
+    uv run python extract.py                    # boucle interactive
+    uv run python extract.py A20230147853       # one-shot
+    uv run python extract.py A20230147853 --json
+    uv run python extract.py A20230147853 --approche juridique
+    uv run python extract.py A20230147853 --analyse courte   # analyse en 2-3 phrases
+    uv run python extract.py A20230147853 --no-reasoning   # sans raisonnement du modèle
 """
 from __future__ import annotations
 
@@ -32,9 +32,11 @@ import argparse
 import json
 import os
 import random
+import re
 import sys
 import textwrap
 import time
+import unicodedata
 from collections.abc import Callable, Sequence
 from datetime import date, datetime
 from decimal import ROUND_HALF_UP, Decimal
@@ -50,19 +52,20 @@ if os.path.isdir("citrus-ia-gen"):
 from src import logger
 from src.bodacc.api import BodaccFetchError, bodacc_api
 from src.bodacc import normalize_bodacc_announcement
-from src.llm.client import ask, get_model_name, parse_json_answer
+from src.llm.client import ask, get_model_name, parse_json_answer, trace_attributes
+from src.s3 import AWS_PROFILE, DEFAULT_S3_ENDPOINT, storage_options
 from src.utils import annuaire, is_luhn_valid
 
 
-# Approche → libellé ; chacune a son prompt `bourrin_prompt_<approche>.md`.
+# Approche → libellé ; chacune a son prompt `prompts/<approche>.md`.
 APPROACHES = {
     "metier": "règles métier",
     "juridique": "lecture juridique",
 }
 DEFAULT_APPROACH = "metier"
 PROMPT_VERSIONS = {
-    "metier": "bourrin-metier-v2",
-    "juridique": "bourrin-juridique-v2",
+    "metier": "metier-v3",
+    "juridique": "juridique-v4",
 }
 
 # Mode du champ `analyse` → libellé. Il change le prompt système (format de sortie).
@@ -74,7 +77,6 @@ ANALYSIS_MODES = {
 DEFAULT_ANALYSIS = "complete"
 
 ANNOTATIONS_PATH = "s3://projet-citrus/data/operations_verifiees.parquet"
-DEFAULT_S3_ENDPOINT = "https://minio.lab.sspcloud.fr"
 ANNOTATION_ID_COLUMN = "ref_annonce_complet"
 
 OPERATION_CODES = ("VE", "FU", "AB", "TP", "SP", "AP", "ST", "LG")
@@ -108,15 +110,33 @@ _DATE_INPUT_FORMATS = (
     "%d.%m.%Y",
     "%Y/%m/%d",
 )
+# Dates en toutes lettres (« 1er janvier 2024 »), lues sur le texte sans accents.
+_FRENCH_MONTHS = {
+    "janvier": 1,
+    "fevrier": 2,
+    "mars": 3,
+    "avril": 4,
+    "mai": 5,
+    "juin": 6,
+    "juillet": 7,
+    "aout": 8,
+    "septembre": 9,
+    "octobre": 10,
+    "novembre": 11,
+    "decembre": 12,
+}
+_TEXTUAL_DATE = re.compile(
+    rf"(\d{{1,2}})(?:\s*er)?\s+({'|'.join(_FRENCH_MONTHS)})\s+(\d{{4}})", re.IGNORECASE
+)
 
 # Gabarits de prompt système versionnés à part, à la racine du repo, pour rester
 # lisibles. Les retours à la ligne des fichiers sont envoyés tels quels au LLM.
 # Le corps des gabarits ne cite jamais `analyse` : tout ce qui le concerne passe
 # par les emplacements {{ANALYSE_JSON}} (exemple JSON) et {{ANALYSE_REGLES}}
 # (règles de sortie), remplis selon le mode.
-PROMPT_DIR = Path(__file__).resolve().parent
+PROMPT_DIR = Path(__file__).resolve().parent / "prompts"
 _PROMPT_TEMPLATES = {
-    approach: (PROMPT_DIR / f"bourrin_prompt_{approach}.md")
+    approach: (PROMPT_DIR / f"{approach}.md")
     .read_text(encoding="utf-8")
     .strip()
     for approach in APPROACHES
@@ -203,7 +223,7 @@ def system_prompt(
     return prompt
 
 
-def build_bourrin_messages(
+def build_extraction_messages(
     payload: dict[str, Any],
     approach: str = DEFAULT_APPROACH,
     analysis: str = DEFAULT_ANALYSIS,
@@ -267,6 +287,18 @@ def _normalized_date(value: Any, warnings: list[str], field: str) -> str | None:
             return datetime.strptime(text, date_format).date().isoformat()
         except ValueError:
             continue
+    accentless = "".join(
+        character
+        for character in unicodedata.normalize("NFKD", text)
+        if not unicodedata.combining(character)
+    )
+    match = _TEXTUAL_DATE.fullmatch(accentless)
+    if match:
+        day, month, year = match.groups()
+        try:
+            return date(int(year), _FRENCH_MONTHS[month.lower()], int(day)).isoformat()
+        except ValueError:
+            pass
     warnings.append(f"{field} n'est pas une date reconnue : {value!r}")
     return None
 
@@ -418,41 +450,18 @@ def normalize_answer(
     return envelope, warnings
 
 
-def _storage_options() -> dict[str, str] | None:
-    """Identifiants S3 : variables d'environnement si présentes, sinon profil AWS.
-
-    Le datalab SSP Cloud expose les clés en variables d'environnement ; le reste
-    du dépôt suppose un profil AWS nommé ``service-account``. On accepte les deux.
-    """
-
-    endpoint = os.environ.get("AWS_ENDPOINT_URL")
-    if endpoint is None and os.environ.get("AWS_S3_ENDPOINT"):
-        endpoint = f"https://{os.environ['AWS_S3_ENDPOINT']}"
-    options = {
-        "aws_endpoint_url": endpoint or DEFAULT_S3_ENDPOINT,
-        "aws_region": os.environ.get("AWS_DEFAULT_REGION", "us-east-1"),
-    }
-    if not os.environ.get("AWS_ACCESS_KEY_ID"):
-        return None
-    options["aws_access_key_id"] = os.environ["AWS_ACCESS_KEY_ID"]
-    options["aws_secret_access_key"] = os.environ["AWS_SECRET_ACCESS_KEY"]
-    if os.environ.get("AWS_SESSION_TOKEN"):
-        options["aws_session_token"] = os.environ["AWS_SESSION_TOKEN"]
-    return options
-
-
 def load_annotations(source: str = ANNOTATIONS_PATH) -> pl.DataFrame:
     """Charger le fichier d'opérations vérifiées (S3 ou chemin local).
 
     Utilisable directement en REPL :
-        >>> from bourrin import load_annotations, describe_annotations
+        >>> from extract import load_annotations, describe_annotations
         >>> df = load_annotations()
         >>> print(describe_annotations(df))
     """
 
     if not str(source).startswith("s3://"):
         return pl.read_parquet(source)
-    options = _storage_options()
+    options = storage_options()
     if options is not None:
         return pl.read_parquet(source, storage_options=options)
     return pl.read_parquet(
@@ -462,7 +471,7 @@ def load_annotations(source: str = ANNOTATIONS_PATH) -> pl.DataFrame:
             "aws_region": "us-east-1",
         },
         credential_provider=pl.CredentialProviderAWS(
-            profile_name="service-account", region_name="us-east-1"
+            profile_name=AWS_PROFILE, region_name="us-east-1"
         ),
     )
 
@@ -597,16 +606,22 @@ def format_comparison(
     return "\n".join(lines)
 
 
-def run_bourrin(
+def run_extraction(
     annonce_id: str,
     *,
     approach: str = DEFAULT_APPROACH,
     analysis: str = DEFAULT_ANALYSIS,
     fetch: Callable[[str], dict[str, Any]] | None = None,
     ask_fn: Callable[..., str] | None = None,
+    trace_session: str | None = None,
+    trace_metadata: dict[str, str] | None = None,
     **ask_options: Any,
 ) -> dict[str, Any]:
-    """Enchaîner fetch BODACC → appel LLM unique (prompt de l'approche) → normalisation."""
+    """Enchaîner fetch BODACC → appel LLM unique (prompt de l'approche) → normalisation.
+
+    `trace_session` et `trace_metadata` étiquettent la trace Langfuse de l'appel
+    (sans effet si Langfuse n'est pas configuré) ; ils ne vont pas au client LLM.
+    """
 
     _check_approach(approach)
     _check_analysis(analysis)
@@ -614,9 +629,15 @@ def run_bourrin(
     ask_fn = ask_fn or ask
 
     payload = _expand_payload(dict(fetch(annonce_id)))
-    messages = build_bourrin_messages(payload, approach, analysis)
+    messages = build_extraction_messages(payload, approach, analysis)
     started = time.monotonic()
-    raw_answer = ask_fn(messages, **ask_options)
+    with trace_attributes(
+        trace_name="extraction",
+        session_id=trace_session,
+        tags=[approach, PROMPT_VERSIONS[approach], f"analyse-{analysis}"],
+        metadata={"annonce_id": annonce_id, **(trace_metadata or {})},
+    ):
+        raw_answer = ask_fn(messages, **ask_options)
     elapsed = time.monotonic() - started
     answer = parse_json_answer(raw_answer)
     if not answer:
@@ -745,7 +766,7 @@ def run_interactive(
     """Boucle interactive : un identifiant d'annonce par ligne."""
 
     print(
-        f"citrus bourrin — approche {APPROACHES[approach]}, "
+        f"citrus extract — approche {APPROACHES[approach]}, "
         f"prompt {PROMPT_VERSIONS[approach]}, analyse {ANALYSIS_MODES[analysis]}, "
         f"modèle {get_model_name()}, "
         f"raisonnement {reasoning_label(ask_options)}"
@@ -813,7 +834,7 @@ def run_interactive(
             print(f"  commande inconnue : {entry}")
             continue
         try:
-            last = run_bourrin(
+            last = run_extraction(
                 entry, approach=approach, analysis=analysis, **ask_options
             )
         except BodaccFetchError as error:
@@ -913,7 +934,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     status = 0
     for annonce_id in args.annonce_ids:
         try:
-            result = run_bourrin(
+            result = run_extraction(
                 annonce_id,
                 approach=args.approche,
                 analysis=args.analyse,

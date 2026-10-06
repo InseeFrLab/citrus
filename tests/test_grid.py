@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from explorer_batch import (
+from evaluate import (
     build_argument_parser as batch_parser,
     compute_metrics,
     evaluate,
@@ -13,7 +13,7 @@ from explorer_batch import (
     select_annonces,
     write_meta,
 )
-from explorer_grid import (
+from grid import (
     DURATIONS_FILE,
     METRICS_TEXT_FILE,
     MODEL_ENV,
@@ -29,7 +29,7 @@ from explorer_grid import (
     run_configuration,
     selection_argv,
 )
-from tests.test_explorer_batch import annotations_frame, fake_ask, fake_fetch
+from tests.test_evaluate import annotations_frame, fake_ask, fake_fetch
 
 
 def fake_batch(output_dir):
@@ -80,7 +80,7 @@ class GridTest(unittest.TestCase):
         self.assertEqual(len(grid), 6)
         self.assertTrue(all(not config["reasoning"] for config in grid))
 
-    def test_batch_argv_is_understood_by_explorer_batch(self):
+    def test_batch_argv_is_understood_by_evaluate(self):
         args = build_argument_parser().parse_args(["--types", "VE", "LG", "-n", "5", "--seed", "3"])
         with_reasoning, without = (
             config for config in configurations(["qwen3-8-27b"], [True, False], ["courte"], ["juridique"])
@@ -90,6 +90,7 @@ class GridTest(unittest.TestCase):
         self.assertEqual((parsed.approche, parsed.analyse), ("juridique", "courte"))
         self.assertEqual((parsed.types, parsed.sample_size, parsed.seed), (["VE", "LG"], 5, 3))
         self.assertTrue(parsed.no_browse and parsed.yes)
+        self.assertTrue(parsed.no_mlflow)  # la grille ouvre elle-même le run de la configuration
         self.assertNotIn("--no-reasoning", batch_argv(with_reasoning, [], Path("x")))
 
     def test_all_and_sample_size_are_exclusive(self):
@@ -148,17 +149,21 @@ class RunConfigurationTest(unittest.TestCase):
             seen["model"] = os.environ.get(MODEL_ENV)
             seen["argv"] = argv
             fake_batch(self.output)
-            write_meta(self.output, {"types": ["VE"], "seed": 0, "duree_totale_s": 1.0})
+            write_meta(
+                self.output,
+                {"types": ["VE"], "seed": 0, "duree_totale_s": 1.0, "s3_uri": "s3://p/grid/g/config/"},
+            )
             return 0
 
         fake_mlflow = FakeMlflow()
         with mock.patch.dict(os.environ, {MODEL_ENV: "avant"}), \
-                mock.patch("explorer_batch.main", fake_main):
+                mock.patch("evaluate.main", fake_main):
             self.assertTrue(run_configuration(fake_mlflow, self.config, [], self.output))
             self.assertEqual(os.environ[MODEL_ENV], "avant")
         self.assertEqual(seen["model"], "gemma4-26b-moe")
         self.assertEqual(fake_mlflow.status, "FINISHED")
         self.assertEqual(fake_mlflow.params["analyse"], "aucune")
+        self.assertEqual(fake_mlflow.tags["s3_uri"], "s3://p/grid/g/config/")
         self.assertIn("duree_moyenne_s", fake_mlflow.metrics)
         self.assertTrue((self.output / METRICS_TEXT_FILE).exists())
         self.assertTrue((self.output / DURATIONS_FILE).exists())
@@ -166,7 +171,7 @@ class RunConfigurationTest(unittest.TestCase):
 
     def test_failing_batch_marks_run_failed(self):
         fake_mlflow = FakeMlflow()
-        with mock.patch("explorer_batch.main", side_effect=RuntimeError("boom")):
+        with mock.patch("evaluate.main", side_effect=RuntimeError("boom")):
             self.assertFalse(run_configuration(fake_mlflow, self.config, [], self.output))
         self.assertEqual(fake_mlflow.status, "FAILED")
         self.assertIn("boom", fake_mlflow.tags["erreur"])
@@ -200,7 +205,7 @@ class CredentialsTest(unittest.TestCase):
 
     def test_main_stops_before_any_llm_call_without_credentials(self):
         with mock.patch.dict(os.environ, {}, clear=True), \
-                mock.patch("explorer_batch.main") as batch_main, \
+                mock.patch("evaluate.main") as batch_main, \
                 mock.patch("sys.stderr"):
             self.assertEqual(main(["-n", "1", "--yes"]), 2)
         batch_main.assert_not_called()

@@ -10,10 +10,11 @@ operation types an announcement is (`VE`, `FU`, `AB`, `TP`, `SP`, `AP`, `ST`, `L
 business fields it carries — above all the SIREN of the transferor (*cédant*) and of the
 beneficiary.
 
-The active approach is "bourrin": one generic prompt, one LLM call doing classification *and*
-extraction, for all eight types (`bourrin.py` and the `explorer*.py` scripts around it).
+The active approach — single-call extraction (called "bourrin" in git history) — is one generic prompt and one LLM call doing
+classification *and* extraction for all eight types: `extract.py`, plus `evaluate.py`, `grid.py`
+and `notebook.py` layered on top. Code, comments, CLI flags and prompts are mostly in French.
 
-**`old/` is a frozen archive** of everything earlier that bourrin does not use: the legacy
+**`old/` is a frozen archive** of everything earlier that this approach does not use: the legacy
 `VE`-only S3 evaluation (`main.py`, `modele/evaluate.py`, `metrics.py`) and the decomposed
 pipeline (LLM routing `src/routing`, per-type extraction `src/operation`, the four
 `src/modele/*_benchmark.py` runners), plus their tests and full pre-trim copies of
@@ -23,95 +24,117 @@ or edit `old/` unless asked; read it for prior art (e.g. the fusion reconciliati
 
 ## Commands
 
-Dependencies are managed with `uv` (Python ≥ 3.13):
-
-```bash
-uv sync
-```
+Dependencies are managed with `uv` (Python ≥ 3.13): `uv sync`.
 
 Tests are plain `unittest` (no pytest), fully offline — LLM calls and BODACC fetches are
 injected fakes:
 
 ```bash
-uv run python -m unittest discover -s tests -t .        # whole suite (~50 tests, <1 s)
-uv run python -m unittest tests.test_explorer_batch     # one module
-uv run python -m unittest tests.test_explorer_grid.GridTest.test_name  # one test
+uv run python -m unittest discover -s tests -t .        # whole suite (~80 tests, ~1.5 s)
+uv run python -m unittest tests.test_evaluate           # one module
+uv run python -m unittest tests.test_grid.GridTest.test_name  # one test
 ```
 
-No linter, formatter or type checker is configured (none in `pyproject.toml`, no pre-commit).
+No linter, formatter or type checker is configured.
 
-The "bourrin" approach — one generic prompt, one LLM call doing routing *and* extraction.
-`--approche metier|juridique` (default `metier`) picks the prompt, on both `bourrin.py` and
-`explorer_batch.py`:
+### `extract.py` — one announcement
 
 ```bash
-uv run python bourrin.py                      # interactive session
-uv run python bourrin.py A20230147853         # one-shot
-uv run python bourrin.py A20230147853 --json  # normalized envelope only, for piping
-uv run python bourrin.py A20230147853 --approche juridique  # legal-reading prompt
-uv run python bourrin.py A20230147853 --analyse courte      # analyse capped at 2-3 sentences
-uv run python bourrin.py A20230147853 --no-annotations  # skip loading annotations (offline, faster)
+uv run python extract.py                      # interactive session
+uv run python extract.py A20230147853         # one-shot
+uv run python extract.py A20230147853 --json  # normalized envelope only, for piping
+uv run python extract.py A20230147853 --approche juridique  # legal-reading prompt (default metier)
+uv run python extract.py A20230147853 --analyse courte      # complete|courte|aucune
+uv run python extract.py A20230147853 --no-annotations      # skip loading annotations
 ```
 
-By default `bourrin.py` loads annotations from `s3://projet-citrus/data/operations_verifiees.parquet`
-(override with `--annotations`); `--json` also skips that load. `--temperature` is forwarded to
-the LLM, and `--no-reasoning` disables model reasoning (faster, direct answer); both flags also
-exist on `explorer_batch.py`. `bourrin.py` has no dedicated unit tests; it is exercised only indirectly through
-`tests/test_explorer_batch.py`.
+By default it loads annotations from `s3://projet-citrus/data/operations_verifiees.parquet`
+(`--annotations` to override; `--json` also skips the load). `--temperature` is forwarded to the
+LLM and `--no-reasoning` disables model reasoning; `--approche`, `--analyse`, `--temperature` and
+`--no-reasoning` exist on `evaluate.py` too. `extract.py` has no dedicated unit tests; it is
+exercised through `tests/test_evaluate.py`.
 
-Batch evaluation of the bourrin approach on annotated operations:
+### `evaluate.py` — batch scoring against annotations
 
 ```bash
-uv run python explorer_batch.py                             # 20 random operations
-uv run python explorer_batch.py --types VE LG -n 50         # filter on annotated type_op
-uv run python explorer_batch.py --types FUSION --per-type -n 5   # FUSION = FU AB SP AP ST
-uv run python explorer_batch.py --types TP --all            # no sampling
-uv run python explorer_batch.py --approche juridique -n 20  # legal-reading prompt
-uv run python explorer_batch.py --analyse aucune            # no analyse field (fastest)
-uv run python explorer_batch.py --load artifacts/bourrin_batch/<timestamp>  # reopen, no LLM call
+uv run python evaluate.py                             # 20 random operations
+uv run python evaluate.py --types VE LG -n 50         # filter on annotated type_op
+uv run python evaluate.py --types FUSION --per-type -n 5   # FUSION = FU AB SP AP ST
+uv run python evaluate.py --types TP --all            # no sampling
+uv run python evaluate.py --analyse aucune            # no analyse field (fastest)
+uv run python evaluate.py --load artifacts/evaluation/<timestamp>  # reopen, no LLM call
+uv run python evaluate.py --load s3://projet-citrus/evaluation/<timestamp>  # reopen from S3
+uv run python evaluate.py -n 5 --no-s3 --no-mlflow   # local only
 ```
 
-It samples annotation *rows* (seeded via `--seed`, default 0, stable order; asks for confirmation
-above 100 announcements unless `--yes`), runs `run_bourrin` over a thread pool
-(`--workers`, default 4), appends each record to `artifacts/bourrin_batch/<timestamp>/results.jsonl`
-(`--output-dir` to override) as it arrives (gitignored; Ctrl-C keeps partial results), then prints metrics and opens a
-`batch>` browsing session (`--no-browse` to skip). Reference rows are stored already normalized
-via `_reference_value` under their annotation column names, so bourrin's `_pair_operations` /
-`format_comparison` work unchanged on reloaded batches. Both approaches are scored against the annotations (the only reference, produced by the
-business rules); `meta.json` records `approche`, `prompt_version` and `analyse`. Field accuracy is
-computed on predicted/annotated operation pairs only. An operation with status `non annotée`
-is an extra *predicted* operation left unmatched — the announcement itself is always annotated.
+It samples annotation *rows* (`--seed`, default 0, stable order; asks for confirmation above 100
+announcements unless `--yes`), runs `run_extraction` over a thread pool (`--workers`, default 4),
+and appends each record to `artifacts/evaluation/<timestamp>/results.jsonl` (`--output-dir`;
+gitignored; Ctrl-C keeps partial results) as it arrives, then prints metrics and opens a `batch>`
+browsing session (`--no-browse` to skip). `meta.json` records `approche`, `prompt_version`,
+`analyse`, `s3_uri`, `mlflow_run_id` and `langfuse_session`.
 
-`explorer_grid.py` runs the full grid (model × reasoning oui/non × analyse × approche, 36
-configurations by default — models from `MODELS` in `explorer_grid.py`; `--modeles`, `--raisonnement`, `--analyses`, `--approches` to
-restrict; `--dry-run` lists it without any call) on one shared sample, and logs each batch as a
-nested MLflow run under a `grille-<timestamp>` parent (experiment `citrus-bourrin-grille` by
-default). It does not reimplement the batch: it calls `explorer_batch.main(argv)` per
-configuration and switches the model by setting `LLM_MODEL_NAME`, which `get_model_name` reads on
-every call — so configurations run sequentially. Batches go to
-`artifacts/bourrin_grid/<timestamp>/<configuration>/` (plus `metriques.txt`,
-`durees_par_type.csv`); `--resume <dir>` skips finished ones and refuses a different sample.
-MLflow credentials are mandatory (`MLFLOW_TRACKING_URI`, plus `MLFLOW_TRACKING_USERNAME`+`_PASSWORD` or `_TOKEN` for http(s)): without them, or if `set_experiment` fails, the script exits with code 2 before any LLM call (`--dry-run` only warns). Tests:
-`tests/test_explorer_grid.py` (fake MLflow, patched `explorer_batch.main`).
+Persistence (so a batch survives deleting the Onyxia service): the local folder stays the source of
+truth, and `src/s3.py:S3Sync` copies it to `<--s3-prefix>/<folder name>/` (default
+`s3://projet-citrus/evaluation/`) every 20 records or 2 min via `run_batch(on_record=…)`, then
+fully at the end. A mid-batch upload failure (e.g. the SSP Cloud's temporary S3 token expiring)
+only logs a warning and is retried on the next trigger. Each batch is also one MLflow run (experiment
+`citrus-evaluation`; params, final metrics from `mlflow_metrics`, the console metrics text as artifact
+`metriques.txt`, tag `s3_uri`). The data itself
+stays on S3, not in MLflow artifacts. S3 write access and MLflow credentials are both checked
+before any LLM call (exit 2); `--no-s3` / `--no-mlflow` disable them. There is no resume: an
+interrupted batch keeps its partial `results.jsonl` (run status `KILLED`), and a relaunch starts over.
+`--load s3://…` downloads into `artifacts/evaluation/s3/<name>/`, so it never overwrites a local
+folder. `tests/test_evaluate.py:MainTest` covers `main` end to end with fake S3/MLflow clients.
 
-`explorer.py` holds the `# %%` cells for driving those functions from a VS Code interactive
-window. Importing `bourrin.py` runs nothing except a REPL convenience: it `chdir`s into
-`citrus-ia-gen/` if launched from the parent directory.
+Scoring details: the annotations (produced by the business rules) are the only reference for
+both approaches. Reference rows are stored already normalized via `_reference_value` under their
+annotation column names, so `_pair_operations` / `format_comparison` work unchanged on reloaded
+batches. Field accuracy is computed on predicted/annotated operation pairs only; amounts count as correct within `AMOUNT_RELATIVE_TOLERANCE` (10 %) of the reference (`_amount_close`). Status
+`non annotée` means an extra *predicted* operation left unmatched — the announcement itself is
+always annotated.
+
+### `grid.py` — full configuration grid in MLflow
+
+Runs model × reasoning (oui/non) × analyse × approche — 36 configurations by default, models from
+`MODELS` in `grid.py`; restrict with `--modeles`, `--raisonnement`, `--analyses`, `--approches`;
+`--dry-run` lists without any call — on one shared sample. Each batch is a nested MLflow run under
+a `grille-<timestamp>` parent (experiment `citrus-grid` by default).
+
+It does not reimplement the batch: it calls `evaluate.main(argv)` per configuration and switches
+the model by setting `LLM_MODEL_NAME`, which `get_model_name` reads on every call — so
+configurations run sequentially. Output: `artifacts/grid/<timestamp>/<configuration>/` (plus
+`metriques.txt`, `durees_par_type.csv`); `--resume <dir>` skips finished ones and refuses a
+different sample. MLflow credentials are mandatory (`MLFLOW_TRACKING_URI`, plus
+`MLFLOW_TRACKING_USERNAME`+`_PASSWORD` or `_TOKEN` for http(s)): without them, or if
+`set_experiment` fails, it exits with code 2 before any LLM call (`--dry-run` only warns). The grid
+owns the MLflow runs, so `batch_argv` passes `--no-mlflow` to `evaluate`, plus
+`--s3-prefix <prefix>/grid/<timestamp>/` (S3 is checked by uploading `annonces.txt`).
+`run_configuration` copies `meta.json`'s `s3_uri` onto the configuration's run as a tag. Tests use
+a fake MLflow and patch `evaluate.main`.
+
+`notebook.py` holds `# %%` cells for a VS Code interactive window. Importing `extract.py` runs
+nothing except a REPL convenience: it `chdir`s into `citrus-ia-gen/` if launched from the parent.
 
 ## Configuration
 
 `.env` at the repo root is loaded on `import src`. `LLM_LAB_API_KEY` is required for anything
 touching an LLM; `LLM_LAB_ENDPOINT` (default `https://llm.lab.sspcloud.fr/api`) and
-`LLM_MODEL_NAME` (default `qwen3-8-27b`, from `DEFAULT_MODEL` in `src/llm/client.py` — the
-module docstring still says `gemma4-26b-moe`, which is stale) override the SSP Cloud lab defaults. Beware that
-the endpoint path is case-sensitive (`/api`, not `/API`) and that a wrong one surfaces as an
-opaque `405 Method Not Allowed`. Langfuse is optional: `get_client` only wraps with
-`langfuse.openai.OpenAI` when both `LANGFUSE_PUBLIC_KEY` and `LANGFUSE_SECRET_KEY` are set. S3/MinIO access uses the AWS profile
-`service-account`. Importing `src` also creates `log/` and opens `log/<timestamp>_citrus.log`.
+`LLM_MODEL_NAME` (default `DEFAULT_MODEL` = `qwen3-8-27b` in `src/llm/client.py`) override the
+SSP Cloud lab defaults. The endpoint path is
+case-sensitive (`/api`, not `/API`); a wrong one surfaces as an opaque `405 Method Not Allowed`.
+Langfuse is optional: when both `LANGFUSE_PUBLIC_KEY` and `LANGFUSE_SECRET_KEY` are set
+(`langfuse_enabled`), `get_client` wraps with `langfuse.openai.OpenAI`, and `run_extraction`
+labels each call via `trace_attributes` (langfuse v4 `propagate_attributes`): trace name
+`extraction`, tags approach/prompt version/analyse, metadata `annonce_id` (+ `type_annote` in a
+batch), and session = batch folder name. Otherwise `trace_attributes` is a no-op and `langfuse` is
+never imported. S3/MinIO credentials (`src/s3.py`, shared by polars and boto3) come from the
+datalab's `AWS_*` env vars, else the AWS profile `service-account`. MLflow connection helpers live
+in `src/tracking.py`. Importing `src` also creates `log/` and opens `log/<timestamp>_citrus.log`.
 
 ## Architecture
 
-**Source layer — `src/`** (only what bourrin needs)
+**Source layer — `src/`**
 - `src/__init__.py`: loads `.env`, configures the `citrus` logger (file + console handler).
 - `src/bodacc/api.py`: `bodacc_api.fetch_annonce_json` fetches one exact announcement and raises
   categorized `BodaccFetchError`s.
@@ -121,51 +144,48 @@ opaque `405 Method Not Allowed`. Langfuse is optional: `get_client` only wraps w
 - `src/llm/client.py`: OpenAI-compatible client (`ask`, `ask_json`, `parse_json_answer`);
   `reasoning=False` sends `reasoning_effort="none"`.
 - `src/utils.py`: `is_luhn_valid` (SIREN check), `annuaire` (public record URL).
+- `src/s3.py`: S3 credentials, `S3Sync` (batch copy), `download_files`; `src/tracking.py`:
+  MLflow credential check and `setup_mlflow` (imports `mlflow` lazily).
 
-**The bourrin approach — `bourrin.py`**
-`run_bourrin` sends the raw BODACC payload (string-encoded JSON fields expanded by
-`_expand_payload`) to a single LLM call with one generic French prompt that asks for the
-operation type *and* every business field at once.
+**Extraction — `extract.py`**
+`run_extraction` sends the raw BODACC payload (string-encoded JSON fields expanded by
+`_expand_payload`) to a single LLM call asking for the operation type *and* every business field.
 
-There are two approaches, each with its own prompt and its own LLM call (split so that one call
-does not have to produce both readings). Both prompts sit at the repo root, are read verbatim
-into `SYSTEM_PROMPTS[approach]`, and are versioned in `PROMPT_VERSIONS`:
+Two approaches, each with its own prompt and its own LLM call (split so one call does not have to
+produce both readings). Prompts live in `prompts/<approach>.md`, are loaded into
+`_PROMPT_TEMPLATES`, and versioned in `PROMPT_VERSIONS`:
 
-- `metier` (`bourrin_prompt_metier.md`): the **business rules** the operators actually apply —
-  the ordered cascade LG → TP → fusion/scission ≤2 → >2 → VE → not retained, the textual anchors
-  for dates and amounts, one operation per secondary SIREN. The annotations were produced by
-  this process.
-- `juridique` (`bourrin_prompt_juridique.md`): the **legal definitions** of the eight types and
-  the confusions to avoid, with no business-rule cascade.
+- `metier` (`prompts/metier.md`): the **business rules** operators actually apply — the ordered
+  cascade LG → TP → fusion/scission ≤2 → >2 → VE → not retained, textual anchors for dates and
+  amounts, one operation per secondary SIREN. The annotations were produced by this process.
+- `juridique` (`prompts/juridique.md`): the **legal definitions** of the eight types and the
+  confusions to avoid, with no business-rule cascade.
 
-The section on announcement structure (§1) is duplicated in both files, so edit both.
+§1 (announcement structure) is duplicated in both prompt files, so edit both.
 
-The `.md` files are **templates**, rendered by `system_prompt(approach, analysis)`.
-`--analyse complete|courte|aucune` (default `complete`, on both CLIs) controls the free-text
-`analyse` field, which is most of the generated text and therefore of the latency. The mode
-fills two placeholders: `{{ANALYSE_JSON}}` (the key in the JSON example, dropped for `aucune`)
-and `{{ANALYSE_REGLES}}` (the output rule, taken from `ANALYSIS_RULES[mode][approach]` in
-`bourrin.py`). The template bodies must never mention `analyse` themselves — anything the model
-should explain goes into `ANALYSIS_RULES`. Otherwise `aucune` would still ask for it.
-`system_prompt` raises if a `{{` placeholder is left unfilled.
+The prompt files are **templates**, rendered by `system_prompt(approach, analysis)`. The
+`--analyse` mode (default `complete`) controls the free-text `analyse` field, which is most of the
+generated text and therefore of the latency. It fills `{{ANALYSE_JSON}}` (the key in the JSON
+example, dropped for `aucune`) and `{{ANALYSE_REGLES}}` (from `ANALYSIS_RULES[mode][approach]`).
+The template bodies must never mention `analyse` themselves — anything the model should explain
+goes into `ANALYSIS_RULES`, otherwise `aucune` would still ask for it. `system_prompt` raises if a
+`{{` placeholder is left unfilled.
 
 Both approaches return the same flat shape — `{id, retenu, codeTypeOperation, operations[],
-analyse}`, with `analyse` absent in mode `aucune` — and the
-normalized envelope adds `approche`. `operations` is a **list**, matching the per-operation
-granularity of the annotation file. `approach` is an explicit keyword on `run_bourrin` /
-`run_batch` / `run_one` (as is `analysis`), kept out of `**ask_options`, which go straight
-to the LLM client.
+analyse}` (`analyse` absent in mode `aucune`); the normalized envelope adds `approche`.
+`operations` is a **list**, matching the per-operation granularity of the annotation file.
+`approach` and `analysis` are explicit keywords on `run_extraction` / `run_batch` / `run_one`,
+kept out of `**ask_options`, which go straight to the LLM client.
 
 Determinism lives in Python, not in the model: `normalize_answer` coerces the free-form answer
-(SIREN zero-padding + Luhn warning, several date formats → ISO, unknown type → `UNKNOWN`), and
-the amount is asked in EUR then converted to the kEUR contract via `_eur_to_integer_keur`.
-`format_comparison` pairs predicted operations with annotated rows on the (cédant, bénéficiaire)
-couple before falling back to order. `fetch`/`ask_fn` are injectable, as elsewhere.
+(SIREN zero-padding + Luhn warning, several date formats → ISO, unknown type → `UNKNOWN`), and the
+amount is asked in EUR then converted to the kEUR contract via `_eur_to_integer_keur`.
+`_pair_operations` pairs predicted operations with annotated rows on the (cédant, bénéficiaire)
+couple before falling back to order.
 
-**Scripts layered on top:** `explorer.py` (VS Code cells) and `explorer_batch.py` import from
-`bourrin.py`; `explorer_grid.py` drives `explorer_batch.main`. Annotation rows are expected to
-carry `ref_annonce_complet` (join key), `type_op`, `siren_cedante`, `siren_beneficiaire`,
-`date_effet_comptable_op`, `date_realisation_juridique_op`, `montant`.
+Annotation rows are expected to carry `ref_annonce_complet` (join key), `type_op`,
+`siren_cedante`, `siren_beneficiaire`, `date_effet_comptable_op`,
+`date_realisation_juridique_op`, `montant`.
 
 ## Conventions that matter here
 
@@ -175,5 +195,5 @@ carry `ref_annonce_complet` (join key), `type_op`, `siren_cedante`, `siren_benef
   joined back for scoring.
 - **Dependency injection over patching internals.** `fetch` / `ask_fn` are parameters — that is
   what keeps the test suite offline.
-- **Prompt versions.** Bump `PROMPT_VERSIONS` in `bourrin.py` when editing a `bourrin_prompt_*.md`
-  file; batch `meta.json` and MLflow runs record it.
+- **Prompt versions.** Bump `PROMPT_VERSIONS` in `extract.py` when editing a `prompts/*.md` file;
+  batch `meta.json` and MLflow runs record it.

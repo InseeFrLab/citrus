@@ -1,7 +1,7 @@
 """Cellules d'exploration interactives — à exécuter une par une dans VS Code.
 
-Séparé de `bourrin.py` pour que le module reste importable : du code au niveau
-module s'exécuterait à chaque `import bourrin`, y compris les appels réseau et
+Séparé de `extract.py` pour que le module reste importable : du code au niveau
+module s'exécuterait à chaque `import extract`, y compris les appels réseau et
 les appels LLM.
 
 Kernel : citrus (uv .venv).
@@ -14,7 +14,7 @@ from dotenv import load_dotenv
 
 load_dotenv(override=True)
 
-from bourrin import (
+from extract import (
     afficher_annonce,
     annotation_for,
     format_annonce,
@@ -22,7 +22,7 @@ from bourrin import (
     format_result,
     load_annotations,
     describe_annotations,
-    run_bourrin,
+    run_extraction,
 )
 from src.bodacc.api import bodacc_api
 
@@ -37,7 +37,7 @@ APPROCHE = "metier"  # ou "juridique" : chaque approche a son propre prompt
 ANALYSE = "complete"  # "courte" (2-3 phrases) ou "aucune" : réponse plus rapide
 
 # %% une annonce de bout en bout
-res = run_bourrin(
+res = run_extraction(
     ANNONCE_ID, approach=APPROCHE, analysis=ANALYSE, reasoning=RAISONNEMENT
 )
 print(format_result(res))

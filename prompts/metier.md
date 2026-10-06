@@ -110,7 +110,9 @@ Rends les montants **en euros**, tels qu'ils figurent dans l'annonce,
 sans séparateur ni décimale (champ `montantNetEuros`) :
 la conversion en milliers d'euros est faite ensuite par le programme,
 ne la fais pas toi-même.
-Rends les dates **telles qu'écrites dans l'annonce**, sans les reformater.
+Rends les dates **au format AAAA-MM-JJ** (« 1er janvier 2024 » → `2024-01-01`),
+sans en changer le jour, le mois ou l'année ;
+null si l'annonce ne donne pas de date complète.
 
 **LG** —
 `montantNetEuros` : null.

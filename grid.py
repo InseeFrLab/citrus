@@ -1,13 +1,16 @@
-"""Grille de batchs bourrin : toutes les configurations, suivies dans MLflow.
+"""Grille d'évaluations : toutes les configurations, suivies dans MLflow.
 
-Lance `explorer_batch.main` une fois par combinaison de
+Lance `evaluate.main` une fois par combinaison de
     modèle × raisonnement (oui/non) × analyse (complete/courte/aucune) × approche (metier/juridique)
 sur le même échantillon d'annonces annotées (mêmes --types, -n, --seed), puis logge
 chaque batch comme un run MLflow, rangé sous un run parent qui représente la grille.
 
-Chaque batch est écrit dans `artifacts/bourrin_grid/<horodatage>/<configuration>/`,
-avec les fichiers habituels de `explorer_batch` (results.jsonl, meta.json, parquets),
+Chaque batch est écrit dans `artifacts/grid/<horodatage>/<configuration>/`,
+avec les fichiers habituels de `evaluate` (results.jsonl, meta.json, parquets),
 plus `metriques.txt` et `durees_par_type.csv`, tous envoyés en artefacts MLflow.
+`evaluate` en fait aussi une copie S3 au fil de l'eau, sous
+`s3://projet-citrus/evaluation/grid/<horodatage>/<configuration>/` (`--s3-prefix`,
+`--no-s3`), dont le chemin est le tag `s3_uri` de chaque run.
 
 MLflow : les credentials doivent être dans l'environnement (injectés par le service
 MLflow du SSP Cloud) : `MLFLOW_TRACKING_URI`, et pour un serveur http(s)
@@ -15,10 +18,10 @@ MLflow du SSP Cloud) : `MLFLOW_TRACKING_URI`, et pour un serveur http(s)
 Sans eux, ou si le serveur refuse la connexion, le script s'arrête avant tout appel LLM.
 
 Usage :
-    uv run python explorer_grid.py --dry-run                     # lister la grille, sans appel
-    uv run python explorer_grid.py -n 20                         # les 36 configurations
-    uv run python explorer_grid.py -n 20 --types VE LG --modeles gemma4-26b-moe --raisonnement non
-    uv run python explorer_grid.py -n 20 --resume artifacts/bourrin_grid/<horodatage>
+    uv run python grid.py --dry-run                     # lister la grille, sans appel
+    uv run python grid.py -n 20                         # les 36 configurations
+    uv run python grid.py -n 20 --types VE LG --modeles gemma4-26b-moe --raisonnement non
+    uv run python grid.py -n 20 --resume artifacts/grid/<horodatage>
         (mêmes options d'échantillon qu'au lancement : c'est vérifié)
 """
 from __future__ import annotations
@@ -27,41 +30,45 @@ import argparse
 import itertools
 import os
 import sys
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-import polars as pl
-
-import explorer_batch
-from bourrin import (
+import evaluate as evaluate_module
+from extract import (
     ANALYSIS_MODES,
     ANNOTATIONS_PATH,
     APPROACHES,
-    COMPARED_FIELDS,
     PROMPT_VERSIONS,
     load_annotations,
 )
-from explorer_batch import (
+from evaluate import (
+    DEFAULT_S3_PREFIX,
     DEFAULT_SAMPLE_SIZE,
     DEFAULT_SEED,
     DEFAULT_WORKERS,
     META_FILE,
+    METRICS_TEXT_FILE,
+    batch_s3_uri,
     compute_metrics,
+    durations_by_type,
     evaluate,
     format_metrics,
     load_batch,
+    mlflow_metrics,
     parse_types,
     select_annonces,
 )
+from src.s3 import S3Sync, S3SyncError
+from src.tracking import MlflowCredentialsError, missing_mlflow_credentials, setup_mlflow
 
 MODELS = ("qwen3-8-27b", "qwen3-6-35b-moe", "gemma4-26b-moe")
 REASONING = {"oui": True, "non": False}
-DEFAULT_EXPERIMENT = "citrus-bourrin-grille"
+DEFAULT_EXPERIMENT = "citrus-grid"
 
 ROOT = Path(__file__).resolve().parent
-GRID_ROOT = ROOT / "artifacts" / "bourrin_grid"
+GRID_ROOT = ROOT / "artifacts" / "grid"
 MODEL_ENV = "LLM_MODEL_NAME"
 
 # Durée LLM approximative par annonce, pour l'ordre de grandeur du --dry-run
@@ -70,7 +77,6 @@ ESTIMATED_SECONDS = {True: 20.0, False: 5.0}
 # Au-delà de ce nombre d'appels LLM, le lancement demande confirmation (sauf --yes).
 CONFIRMATION_THRESHOLD = 200
 
-METRICS_TEXT_FILE = "metriques.txt"
 DURATIONS_FILE = "durees_par_type.csv"
 
 
@@ -129,12 +135,15 @@ def selection_argv(args: argparse.Namespace) -> list[str]:
 
 
 def batch_argv(config: dict[str, Any], selection: Sequence[str], output_dir: Path) -> list[str]:
-    """Arguments de `explorer_batch.main` pour une configuration."""
+    """Arguments de `evaluate.main` pour une configuration."""
 
     argv = ["--approche", config["approach"], "--analyse", config["analysis"]]
     if not config["reasoning"]:
         argv.append("--no-reasoning")
-    return [*argv, *selection, "--output-dir", str(output_dir), "--no-browse", "--yes"]
+    # Le run MLflow de la configuration est ouvert ici, pas par evaluate.
+    return [
+        *argv, *selection, "--output-dir", str(output_dir), "--no-browse", "--yes", "--no-mlflow",
+    ]
 
 
 def is_complete(output_dir: Path) -> bool:
@@ -148,114 +157,8 @@ def is_complete(output_dir: Path) -> bool:
 
 
 # --------------------------------------------------------------------------
-# Métriques MLflow
-# --------------------------------------------------------------------------
-
-
-def _share(count: int, total: int) -> float | None:
-    return count / total if total else None
-
-
-def durations_by_type(annonces: pl.DataFrame) -> pl.DataFrame:
-    """Temps d'inférence des annonces traitées, par type annoté."""
-
-    return (
-        annonces.filter((pl.col("statut") == "ok") & pl.col("duree_s").is_not_null())
-        .group_by("type_annote")
-        .agg(
-            pl.len().alias("n"),
-            pl.col("duree_s").mean().alias("duree_moyenne_s"),
-            pl.col("duree_s").median().alias("duree_mediane_s"),
-        )
-        .sort("type_annote")
-    )
-
-
-def mlflow_metrics(
-    metrics: dict[str, Any], meta: dict[str, Any], annonces: pl.DataFrame
-) -> dict[str, float]:
-    """Aplatir `compute_metrics` en métriques numériques pour MLflow.
-
-    Les taux ont les mêmes dénominateurs que `format_metrics` : les annonces
-    traitées (`ok`) pour le niveau annonce, les opérations appariées pour les champs.
-    Un taux sans dénominateur est omis plutôt que mis à 0.
-    """
-
-    ok = metrics["ok"]
-    paired = metrics["operations_appariees"]
-    values: dict[str, float | None] = {
-        "annonces": metrics["annonces"],
-        "annonces_ok": ok,
-        "erreurs": metrics["annonces"] - ok,
-        "reponses_vides": metrics["reponses_vides"],
-        "alertes_luhn": metrics["alertes_luhn"],
-        "taux_ok": _share(ok, metrics["annonces"]),
-        "taux_retenu": _share(metrics["retenu"], ok),
-        "taux_type_ok": _share(metrics["type_ok"], ok),
-        "taux_nombre_operations_ok": _share(metrics["nombre_operations_ok"], ok),
-        "operations_appariees": paired,
-        "taux_tout_exact": _share(metrics["tout_exact"], paired),
-        "taux_montant_proche": _share(metrics["montant_proche"], paired),
-        "duree_mediane_s": metrics["duree_mediane_s"],
-        "duree_totale_llm_s": metrics["duree_totale_llm_s"],
-        "duree_totale_s": meta.get("duree_totale_s"),
-    }
-    for field in COMPARED_FIELDS:
-        values[f"taux_{field}_exact"] = _share(metrics["champs"][field]["exact"], paired)
-    for row in metrics["par_type"]:
-        values[f"taux_type_ok_{row['type']}"] = _share(row["type_ok"], row["ok"])
-
-    done = annonces.filter((pl.col("statut") == "ok") & pl.col("duree_s").is_not_null())
-    values["duree_moyenne_s"] = done["duree_s"].mean() if done.height else None
-    for row in durations_by_type(annonces).iter_rows(named=True):
-        values[f"duree_moyenne_s_{row['type_annote']}"] = row["duree_moyenne_s"]
-
-    return {name: float(value) for name, value in values.items() if value is not None}
-
-
-# --------------------------------------------------------------------------
 # Lancement
 # --------------------------------------------------------------------------
-
-
-class MlflowCredentialsError(RuntimeError):
-    """Credentials MLflow absents ou refusés par le serveur."""
-
-
-def missing_mlflow_credentials(env: Mapping[str, str] = os.environ) -> list[str]:
-    """Variables d'environnement MLflow manquantes (liste vide si tout y est)."""
-
-    uri = env.get("MLFLOW_TRACKING_URI", "")
-    if not uri:
-        return ["MLFLOW_TRACKING_URI"]
-    if not uri.startswith(("http://", "https://")) or env.get("MLFLOW_TRACKING_TOKEN"):
-        return []
-    return [
-        name
-        for name in ("MLFLOW_TRACKING_USERNAME", "MLFLOW_TRACKING_PASSWORD")
-        if not env.get(name)
-    ]
-
-
-def setup_mlflow(experiment: str):
-    """Vérifier les credentials et la connexion, puis choisir l'expérience."""
-
-    missing = missing_mlflow_credentials()
-    if missing:
-        raise MlflowCredentialsError(
-            f"credentials MLflow absents : {', '.join(missing)} "
-            "(lancer le service avec MLflow activé, ou les exporter dans l'environnement)"
-        )
-    import mlflow
-
-    try:
-        # Contacte le serveur : une URI ou des identifiants faux échouent ici.
-        mlflow.set_experiment(experiment)
-    except Exception as error:
-        raise MlflowCredentialsError(
-            f"connexion à MLflow impossible ({os.environ['MLFLOW_TRACKING_URI']}) : {error}"
-        ) from error
-    return mlflow
 
 
 def run_configuration(mlflow, config: dict[str, Any], selection: Sequence[str], output_dir: Path) -> bool:
@@ -276,12 +179,14 @@ def run_configuration(mlflow, config: dict[str, Any], selection: Sequence[str], 
         )
         mlflow.set_tag("dossier_batch", str(output_dir))
         os.environ[MODEL_ENV] = config["model"]
-        code = explorer_batch.main(batch_argv(config, selection, output_dir))
+        code = evaluate_module.main(batch_argv(config, selection, output_dir))
         if code != 0:
-            mlflow.set_tag("erreur", f"explorer_batch a renvoyé {code}")
+            mlflow.set_tag("erreur", f"evaluate a renvoyé {code}")
             return False
 
         meta, records = load_batch(output_dir)
+        if meta.get("s3_uri"):
+            mlflow.set_tag("s3_uri", meta["s3_uri"])
         annonces, operations = evaluate(records)
         metrics = compute_metrics(annonces, operations)
         (output_dir / METRICS_TEXT_FILE).write_text(
@@ -330,7 +235,7 @@ def _estimate(grid: Sequence[dict[str, Any]], annonces: int, workers: int) -> st
 
 def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Lancer explorer_batch sur une grille de configurations, suivie dans MLflow"
+        description="Lancer evaluate sur une grille de configurations, suivie dans MLflow"
     )
     selection = parser.add_argument_group("échantillon (commun à toute la grille)")
     selection.add_argument("--types", nargs="+", help="types annotés à garder ; défaut : tous")
@@ -359,6 +264,11 @@ def build_argument_parser() -> argparse.ArgumentParser:
         "--experiment", default=DEFAULT_EXPERIMENT,
         help=f"expérience MLflow (défaut : {DEFAULT_EXPERIMENT}, créée si absente)",
     )
+    parser.add_argument(
+        "--s3-prefix", default=DEFAULT_S3_PREFIX,
+        help=f"copie des batchs sous <préfixe>/grid/<horodatage>/ (défaut : {DEFAULT_S3_PREFIX})",
+    )
+    parser.add_argument("--no-s3", action="store_true", help="ne pas copier les batchs sur S3")
     parser.add_argument(
         "--resume", type=Path, default=None,
         help="reprendre une grille : les configurations déjà terminées sont sautées",
@@ -404,12 +314,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 2
+    # Même dossier, même préfixe S3 : une reprise complète la copie existante.
+    grid_sync = None if args.no_s3 else S3Sync(batch_s3_uri(f"{args.s3_prefix}/grid", grid_dir), grid_dir)
     pending = [config for config in grid if not is_complete(grid_dir / config["name"])]
     calls = len(pending) * len(annonce_ids)
     print(
         f"{len(grid)} configuration(s), {len(pending)} à lancer — {len(annonce_ids)} annonce(s) "
         f"— types {', '.join(types)} — {calls} appels LLM, {_estimate(pending, len(annonce_ids), args.workers)}\n"
         f"dossier : {grid_dir}\nexpérience MLflow : {args.experiment}"
+        + (f"\ncopie S3 : {grid_sync.uri}" if grid_sync else "")
     )
     for config in grid:
         mark = "·" if config in pending else "✓"
@@ -431,8 +344,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     failures = []
     grid_dir.mkdir(parents=True, exist_ok=True)
     (grid_dir / "annonces.txt").write_text("\n".join(annonce_ids) + "\n", encoding="utf-8")
+    if grid_sync is None:
+        selection.append("--no-s3")
+    else:
+        try:
+            grid_sync.check("annonces.txt")
+        except S3SyncError as error:
+            print(f"{error}\n(--no-s3 pour lancer sans copie S3)", file=sys.stderr)
+            return 2
+        selection += ["--s3-prefix", grid_sync.uri]
     with mlflow.start_run(run_name=f"grille-{grid_dir.name}"):
         mlflow.set_tag("dossier_grille", str(grid_dir))
+        if grid_sync is not None:
+            mlflow.set_tag("s3_uri", grid_sync.uri)
         mlflow.log_params(
             {
                 "types": ",".join(types),
@@ -454,7 +378,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if failures:
         print(f"\n{len(failures)} configuration(s) en échec :", *failures, sep="\n  ", file=sys.stderr)
-        print(f"reprendre : uv run python explorer_grid.py --resume {grid_dir} …", file=sys.stderr)
+        print(f"reprendre : uv run python grid.py --resume {grid_dir} …", file=sys.stderr)
         return 1
     print(f"\ngrille terminée : {grid_dir}")
     return 0

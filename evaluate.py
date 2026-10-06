@@ -1,29 +1,40 @@
-"""Batch « bourrin » : lancer l'approche à prompt unique sur des opérations annotées.
+"""Évaluation : lancer l'extraction en un appel sur des opérations annotées.
 
 Tire un échantillon (ou la totalité) des opérations du fichier d'annotations,
 éventuellement filtrées sur le type annoté, envoie chaque annonce à
-`bourrin.run_bourrin` avec le prompt de l'approche choisie (`--approche`,
+`extract.run_extraction` avec le prompt de l'approche choisie (`--approche`,
 `metier` par défaut, ou `juridique`), puis affiche les métriques principales et ouvre une
 session pour examiner les résultats opération par opération.
 
 Chaque résultat est écrit dès qu'il arrive dans
-`artifacts/bourrin_batch/<horodatage>/results.jsonl` : un batch interrompu garde
+`artifacts/evaluation/<horodatage>/results.jsonl` : un batch interrompu garde
 ce qui a été calculé, et `--load` rouvre un batch sans refaire d'appel LLM.
 
+Le dossier est copié au fil de l'eau sur S3, sous
+`s3://projet-citrus/evaluation/<horodatage>/` (`--s3-prefix`, `--no-s3`), pour
+survivre à la suppression du service. Le batch est suivi par un run MLflow
+(expérience `citrus-evaluation`, `--no-mlflow`) qui porte les paramètres, les
+métriques, leur affichage console (artefact `metriques.txt`) et le chemin S3
+(tag `s3_uri`) ; les données restent sur S3. Si
+Langfuse est configuré, les traces des appels LLM sont regroupées dans la
+session `<horodatage>`. S3 et MLflow sont vérifiés avant tout appel LLM.
+
 Usage :
-    uv run python explorer_batch.py                          # 20 opérations au hasard
-    uv run python explorer_batch.py --types VE LG -n 50      # filtrer sur le type annoté
-    uv run python explorer_batch.py --types FUSION --per-type -n 5   # 5 par type de fusion
-    uv run python explorer_batch.py --types TP --all         # toutes les opérations TP
-    uv run python explorer_batch.py --approche juridique     # prompt de lecture juridique
-    uv run python explorer_batch.py --analyse courte         # analyse en 2-3 phrases (plus rapide)
-    uv run python explorer_batch.py --analyse aucune         # pas d'analyse (le plus rapide)
-    uv run python explorer_batch.py --no-reasoning           # sans raisonnement du modèle
-    uv run python explorer_batch.py --load artifacts/bourrin_batch/<horodatage>
+    uv run python evaluate.py                          # 20 opérations au hasard
+    uv run python evaluate.py --types VE LG -n 50      # filtrer sur le type annoté
+    uv run python evaluate.py --types FUSION --per-type -n 5   # 5 par type de fusion
+    uv run python evaluate.py --types TP --all         # toutes les opérations TP
+    uv run python evaluate.py --approche juridique     # prompt de lecture juridique
+    uv run python evaluate.py --analyse courte         # analyse en 2-3 phrases (plus rapide)
+    uv run python evaluate.py --analyse aucune         # pas d'analyse (le plus rapide)
+    uv run python evaluate.py --no-reasoning           # sans raisonnement du modèle
+    uv run python evaluate.py --load artifacts/evaluation/<horodatage>
+    uv run python evaluate.py --load s3://projet-citrus/evaluation/<horodatage>
+    uv run python evaluate.py -n 5 --no-s3 --no-mlflow     # essai local
 
 Les fonctions sont aussi importables depuis une cellule VS Code :
-    >>> from explorer_batch import load_batch, evaluate, compute_metrics, format_metrics
-    >>> meta, records = load_batch("artifacts/bourrin_batch/<horodatage>")
+    >>> from evaluate import load_batch, evaluate, compute_metrics, format_metrics
+    >>> meta, records = load_batch("artifacts/evaluation/<horodatage>")
     >>> annonces, operations = evaluate(records)
     >>> operations.filter(~pl.col("montantNet_ok"))
 """
@@ -31,6 +42,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import statistics
 import sys
 import time
@@ -44,7 +56,7 @@ import logging
 
 import polars as pl
 
-from bourrin import (
+from extract import (
     _ANNOTATION_COLUMNS,
     ANNOTATION_ID_COLUMN,
     ANALYSIS_MODES,
@@ -62,11 +74,13 @@ from bourrin import (
     format_result,
     load_annotations,
     reasoning_label,
-    run_bourrin,
+    run_extraction,
 )
 from src import console_handler
 from src.bodacc.api import BodaccFetchError
-from src.llm.client import get_model_name
+from src.llm.client import flush_traces, get_model_name, langfuse_enabled
+from src.s3 import S3Sync, S3SyncError, download_files
+from src.tracking import MlflowCredentialsError, setup_mlflow
 
 
 FUSION_FAMILY = ("FU", "AB", "SP", "AP", "ST")
@@ -80,9 +94,15 @@ CONFIRMATION_THRESHOLD = 100
 # Tolérance relative de l'indicateur « montant proche », en plus du taux exact.
 AMOUNT_RELATIVE_TOLERANCE = 0.10
 
-OUTPUT_ROOT = Path(__file__).resolve().parent / "artifacts" / "bourrin_batch"
+OUTPUT_ROOT = Path(__file__).resolve().parent / "artifacts" / "evaluation"
+# Les batchs rouverts depuis S3 sont téléchargés ici, sans écraser un dossier local.
+S3_DOWNLOAD_ROOT = OUTPUT_ROOT / "s3"
+DEFAULT_S3_PREFIX = "s3://projet-citrus/evaluation"
+DEFAULT_EXPERIMENT = "citrus-evaluation"
 RESULTS_FILE = "results.jsonl"
 META_FILE = "meta.json"
+# Les métriques telles qu'affichées en console, gardées en artefact (S3 et MLflow).
+METRICS_TEXT_FILE = "metriques.txt"
 
 NON_RETENU = "non retenu"
 SANS_TYPE = "sans type"
@@ -164,7 +184,7 @@ def reference_rows(annotations: pl.DataFrame, annonce_id: str) -> list[dict[str,
     """Lignes annotées d'une annonce, déjà ramenées au format de comparaison.
 
     Les valeurs sont stockées sous les noms de colonnes d'origine : les
-    fonctions de comparaison de `bourrin` s'appliquent telles quelles, y compris
+    fonctions de comparaison de `extract` s'appliquent telles quelles, y compris
     sur un batch rechargé depuis le disque.
     """
 
@@ -186,6 +206,10 @@ def reference_rows(annotations: pl.DataFrame, annonce_id: str) -> list[dict[str,
 # --------------------------------------------------------------------------
 
 
+def _annotated_types(references: Sequence[dict[str, Any]]) -> str:
+    return ",".join(sorted({row["type_op"] for row in references if row.get("type_op")}))
+
+
 def run_one(
     annonce_id: str,
     references: list[dict[str, Any]],
@@ -194,9 +218,14 @@ def run_one(
     analysis: str = DEFAULT_ANALYSIS,
     fetch: Callable[[str], dict[str, Any]] | None = None,
     ask_fn: Callable[..., str] | None = None,
+    trace_session: str | None = None,
     **ask_options: Any,
 ) -> dict[str, Any]:
-    """Traiter une annonce ; une erreur est enregistrée au lieu d'arrêter le batch."""
+    """Traiter une annonce ; une erreur est enregistrée au lieu d'arrêter le batch.
+
+    `trace_session` regroupe les traces Langfuse du batch ; chaque trace porte
+    aussi les types annotés de l'annonce.
+    """
 
     record: dict[str, Any] = {
         "annonce_id": annonce_id,
@@ -206,12 +235,14 @@ def run_one(
         "result": None,
     }
     try:
-        result = run_bourrin(
+        result = run_extraction(
             annonce_id,
             approach=approach,
             analysis=analysis,
             fetch=fetch,
             ask_fn=ask_fn,
+            trace_session=trace_session,
+            trace_metadata={"type_annote": _annotated_types(references)},
             **ask_options,
         )
     except BodaccFetchError as error:
@@ -249,11 +280,14 @@ def run_batch(
     fetch: Callable[[str], dict[str, Any]] | None = None,
     ask_fn: Callable[..., str] | None = None,
     progress: Callable[[str], None] = print,
+    on_record: Callable[[], None] | None = None,
+    trace_session: str | None = None,
     **ask_options: Any,
 ) -> list[dict[str, Any]]:
-    """Lancer `run_bourrin` sur chaque annonce, en parallèle.
+    """Lancer `run_extraction` sur chaque annonce, en parallèle.
 
-    Chaque résultat est ajouté à `output_dir/results.jsonl` dès réception.
+    Chaque résultat est ajouté à `output_dir/results.jsonl` dès réception, puis
+    `on_record` est appelé (copie S3 au fil de l'eau), depuis le thread principal.
     Ctrl-C annule les annonces pas encore parties et renvoie ce qui est acquis.
     """
 
@@ -273,6 +307,7 @@ def run_batch(
             analysis=analysis,
             fetch=fetch,
             ask_fn=ask_fn,
+            trace_session=trace_session,
             **ask_options,
         )
         for annonce_id in annonce_ids
@@ -286,6 +321,8 @@ def run_batch(
                     json.dumps(record, ensure_ascii=False, default=str) + "\n"
                 )
                 results_file.flush()
+                if on_record is not None:
+                    on_record()
             progress(_progress_line(done, len(futures), record))
     except KeyboardInterrupt:
         progress(
@@ -386,6 +423,8 @@ def _operation_schema() -> dict[str, pl.DataType]:
     return schema
 
 
+WARNING_KINDS_SHOWN = 12
+
 ANNONCE_SCHEMA = {
     "annonce_id": pl.String,
     "type_annote": pl.String,
@@ -398,15 +437,32 @@ ANNONCE_SCHEMA = {
     "reponse_vide": pl.Boolean,
     "alertes": pl.Int64,
     "alertes_luhn": pl.Int64,
+    "types_alertes": pl.List(pl.String),
     "duree_s": pl.Float64,
 }
+
+
+def warning_kind(warning: str) -> str:
+    """Réduire un avertissement de `extract.py` à sa nature, pour les compter.
+
+    Le contexte (lecture, numéro d'opération) et la valeur fautive sont retirés,
+    le champ est gardé : « lecture juridique op.2 dateEffetComptable n'est pas
+    une date reconnue : 'mars 2023' » devient « dateEffetComptable n'est pas une
+    date reconnue ».
+    """
+
+    kind = re.sub(r"^.*?\bop\.\d+(?: :)? ", "", warning.strip())
+    kind = re.sub(r"=\S+", "", kind)
+    kind = re.sub(r" : (?:['\"\[{(\d-].*|\w+)$", "", kind)
+    kind = re.sub(r"^[\w ]+ : ", "", kind)
+    return re.sub(r" \(.*\)$", "", kind)
 
 
 def evaluate(records: Sequence[dict[str, Any]]) -> tuple[pl.DataFrame, pl.DataFrame]:
     """Deux tables : une ligne par annonce, une ligne par opération.
 
     Les opérations prédites sont appariées aux lignes
-    annotées comme dans la session bourrin : par couple de SIREN, sinon par ordre.
+    annotées comme dans la session de `extract.py` : par couple de SIREN, sinon par ordre.
     """
 
     annonce_rows: list[dict[str, Any]] = []
@@ -421,6 +477,7 @@ def evaluate(records: Sequence[dict[str, Any]]) -> tuple[pl.DataFrame, pl.DataFr
             "n_ops_annotees": len(references),
             "alertes": 0,
             "alertes_luhn": 0,
+            "types_alertes": [],
         }
         result = record["result"]
         if result is None:
@@ -441,6 +498,7 @@ def evaluate(records: Sequence[dict[str, Any]]) -> tuple[pl.DataFrame, pl.DataFr
             reponse_vide=any("réponse LLM vide" in warning for warning in warnings),
             alertes=len(warnings),
             alertes_luhn=sum("Luhn" in warning for warning in warnings),
+            types_alertes=[warning_kind(warning) for warning in warnings],
             duree_s=result["elapsed_seconds"],
         )
         annonce_rows.append(row)
@@ -459,6 +517,23 @@ def evaluate(records: Sequence[dict[str, Any]]) -> tuple[pl.DataFrame, pl.DataFr
     operations = pl.DataFrame(operation_rows, schema=_operation_schema())
     operations = operations.with_row_index("n", offset=1)
     return annonces, operations
+
+
+def _warning_kinds(done: pl.DataFrame) -> list[dict[str, Any]]:
+    """Par nature d'avertissement : occurrences et annonces touchées, du plus fréquent."""
+
+    kinds = (
+        done.select("annonce_id", "types_alertes")
+        .explode("types_alertes")
+        .drop_nulls("types_alertes")
+        .group_by("types_alertes")
+        .agg(pl.len().alias("occurrences"), pl.col("annonce_id").n_unique().alias("annonces"))
+        .sort(["occurrences", "types_alertes"], descending=[True, False])
+    )
+    return [
+        {"type": row["types_alertes"], "occurrences": row["occurrences"], "annonces": row["annonces"]}
+        for row in kinds.iter_rows(named=True)
+    ]
 
 
 def compute_metrics(annonces: pl.DataFrame, operations: pl.DataFrame) -> dict[str, Any]:
@@ -528,9 +603,79 @@ def compute_metrics(annonces: pl.DataFrame, operations: pl.DataFrame) -> dict[st
         "confusion": confusion,
         "alertes_luhn": int(done["alertes_luhn"].sum()),
         "annonces_avec_alertes": int((done["alertes"] > 0).sum()),
+        "alertes": int(done["alertes"].sum()),
+        "types_alertes": _warning_kinds(done),
         "duree_mediane_s": statistics.median(durations) if durations else None,
         "duree_totale_llm_s": sum(durations),
     }
+
+
+# --------------------------------------------------------------------------
+# Métriques MLflow
+# --------------------------------------------------------------------------
+
+
+def _share(count: int, total: int) -> float | None:
+    return count / total if total else None
+
+
+def durations_by_type(annonces: pl.DataFrame) -> pl.DataFrame:
+    """Temps d'inférence des annonces traitées, par type annoté."""
+
+    return (
+        annonces.filter((pl.col("statut") == "ok") & pl.col("duree_s").is_not_null())
+        .group_by("type_annote")
+        .agg(
+            pl.len().alias("n"),
+            pl.col("duree_s").mean().alias("duree_moyenne_s"),
+            pl.col("duree_s").median().alias("duree_mediane_s"),
+        )
+        .sort("type_annote")
+    )
+
+
+def mlflow_metrics(
+    metrics: dict[str, Any], meta: dict[str, Any], annonces: pl.DataFrame
+) -> dict[str, float]:
+    """Aplatir `compute_metrics` en métriques numériques pour MLflow.
+
+    Les taux ont les mêmes dénominateurs que `format_metrics` : les annonces
+    traitées (`ok`) pour le niveau annonce, les opérations appariées pour les champs.
+    Un taux sans dénominateur est omis plutôt que mis à 0.
+    """
+
+    ok = metrics["ok"]
+    paired = metrics["operations_appariees"]
+    values: dict[str, float | None] = {
+        "annonces": metrics["annonces"],
+        "annonces_ok": ok,
+        "erreurs": metrics["annonces"] - ok,
+        "reponses_vides": metrics["reponses_vides"],
+        "alertes_luhn": metrics["alertes_luhn"],
+        "alertes": metrics["alertes"],
+        "annonces_avec_alertes": metrics["annonces_avec_alertes"],
+        "taux_ok": _share(ok, metrics["annonces"]),
+        "taux_retenu": _share(metrics["retenu"], ok),
+        "taux_type_ok": _share(metrics["type_ok"], ok),
+        "taux_nombre_operations_ok": _share(metrics["nombre_operations_ok"], ok),
+        "operations_appariees": paired,
+        "taux_tout_exact": _share(metrics["tout_exact"], paired),
+        "taux_montant_proche": _share(metrics["montant_proche"], paired),
+        "duree_mediane_s": metrics["duree_mediane_s"],
+        "duree_totale_llm_s": metrics["duree_totale_llm_s"],
+        "duree_totale_s": meta.get("duree_totale_s"),
+    }
+    for field in COMPARED_FIELDS:
+        values[f"taux_{field}_exact"] = _share(metrics["champs"][field]["exact"], paired)
+    for row in metrics["par_type"]:
+        values[f"taux_type_ok_{row['type']}"] = _share(row["type_ok"], row["ok"])
+
+    done = annonces.filter((pl.col("statut") == "ok") & pl.col("duree_s").is_not_null())
+    values["duree_moyenne_s"] = done["duree_s"].mean() if done.height else None
+    for row in durations_by_type(annonces).iter_rows(named=True):
+        values[f"duree_moyenne_s_{row['type_annote']}"] = row["duree_moyenne_s"]
+
+    return {name: float(value) for name, value in values.items() if value is not None}
 
 
 # --------------------------------------------------------------------------
@@ -576,7 +721,7 @@ def format_metrics(metrics: dict[str, Any], meta: dict[str, Any] | None = None) 
     label = APPROACHES.get(meta.get("approche"), "?")
     lines = [
         "═" * 78,
-        f"  Batch bourrin — approche {label}"
+        f"  Évaluation — approche {label}"
         f", prompt {meta.get('prompt_version', '?')}"
         f", analyse {ANALYSIS_MODES.get(meta.get('analyse'), '?')}"
         f", modèle {meta.get('modele', '?')}"
@@ -612,8 +757,21 @@ def format_metrics(metrics: dict[str, Any], meta: dict[str, Any] | None = None) 
         f"  Retenue comme restructuration  {_ratio(metrics['retenu'], ok)}",
         f"  Type exact                     {_ratio(metrics['type_ok'], ok)}",
         f"  Nombre d'opérations exact      {_ratio(metrics['nombre_operations_ok'], ok)}",
-        f"  Alertes Luhn sur un SIREN      {metrics['alertes_luhn']}"
-        f"  ({metrics['annonces_avec_alertes']} annonce(s) avec avertissements)",
+        "",
+        f"  Avertissements de normalisation : {metrics['alertes']}"
+        f" sur {_ratio(metrics['annonces_avec_alertes'], ok)} annonce(s)",
+    ]
+    if metrics["types_alertes"]:
+        lines.append("  occurrences  annonces  nature")
+        for row in metrics["types_alertes"][:WARNING_KINDS_SHOWN]:
+            lines.append(f"  {row['occurrences']:>11}  {row['annonces']:>8}  {row['type']}")
+        hidden = metrics["types_alertes"][WARNING_KINDS_SHOWN:]
+        if hidden:
+            lines.append(
+                f"  {sum(row['occurrences'] for row in hidden):>11}"
+                f"  {'':>8}  … {len(hidden)} autre(s) nature(s)"
+            )
+    lines += [
         "",
         "  Par type annoté        n  retenu   type ok",
     ]
@@ -714,9 +872,14 @@ BROWSE_HELP = """Commandes :
                        (type, cedant, beneficiaire, effet, realisation, montant,
                        ou sa lettre de colonne T C B E R M),
                        ou « erreurs » (toute opération pas entièrement exacte)
-  :texte <n>         l'annonce en clair
-  :payload <n>       le JSON BODACC de l'annonce
-  :raw <n>           la réponse brute du LLM
+  :texte <n|id>      l'annonce en clair
+  :payload <n|id>    le JSON BODACC de l'annonce
+  :raw <n|id>        la réponse brute du LLM
+
+  <id> : identifiant d'annonce, sans tenir compte de la casse ; un fragment
+  suffit s'il ne désigne qu'une annonce (A202301491199, a202301491199,
+  1491199…). Un nombre qui est un numéro d'opération de :liste désigne
+  l'opération.
   :metriques         réafficher les métriques
   :help              cette aide
   :quit              quitter (ou Ctrl-D)"""
@@ -724,16 +887,33 @@ BROWSE_HELP = """Commandes :
 
 def _record_for(
     entry: str, operations: pl.DataFrame, records: dict[str, dict[str, Any]]
-) -> tuple[dict[str, Any] | None, int | None]:
-    """Retrouver l'annonce désignée par un numéro d'opération ou un identifiant."""
+) -> tuple[dict[str, Any], int | None]:
+    """Retrouver l'annonce désignée par un numéro d'opération ou un identifiant.
+
+    Ordre de priorité : identifiant exact, numéro d'opération, puis identifiant
+    sans tenir compte de la casse, entier ou fragment unique. `LookupError`
+    porte le message à afficher quand rien ou plusieurs annonces correspondent.
+    """
 
     entry = entry.strip()
+    if not entry:
+        raise LookupError("opération ou annonce manquante")
+    if entry in records:
+        return records[entry], None
     if entry.isdigit():
         rows = operations.filter(pl.col("n") == int(entry))
-        if not rows.height:
-            return None, None
-        return records.get(rows["annonce_id"][0]), int(entry)
-    return records.get(entry), None
+        if rows.height:
+            return records[rows["annonce_id"][0]], int(entry)
+    needle = entry.casefold()
+    matches = [
+        annonce_id for annonce_id in records if annonce_id.casefold() == needle
+    ] or [annonce_id for annonce_id in records if needle in annonce_id.casefold()]
+    if len(matches) == 1:
+        return records[matches[0]], None
+    if not matches:
+        raise LookupError(f"opération ou annonce introuvable : {entry}")
+    shown = ", ".join(sorted(matches)[:10]) + (" …" if len(matches) > 10 else "")
+    raise LookupError(f"{len(matches)} annonces correspondent à {entry} : {shown}")
 
 
 def format_detail(record: dict[str, Any], n: int | None = None) -> str:
@@ -786,10 +966,12 @@ def browse(
                 continue
             print(format_operation_list(selected))
         elif command in {":texte", ":payload", ":raw"}:
-            record, _ = _record_for(argument, operations, by_id)
-            if record is None:
-                print(f"  opération ou annonce introuvable : {argument or '(rien)'}")
-            elif record["result"] is None:
+            try:
+                record, _ = _record_for(argument, operations, by_id)
+            except LookupError as error:
+                print(f"  {error}")
+                continue
+            if record["result"] is None:
                 print(f"  ✗ {record['erreur']}")
             elif command == ":texte":
                 print(format_annonce(record["result"]["payload"]))
@@ -800,11 +982,12 @@ def browse(
         elif command.startswith(":"):
             print(f"  commande inconnue : {command}")
         else:
-            record, n = _record_for(entry, operations, by_id)
-            if record is None:
-                print(f"  opération ou annonce introuvable : {entry}")
-            else:
-                print(format_detail(record, n))
+            try:
+                record, n = _record_for(entry, operations, by_id)
+            except LookupError as error:
+                print(f"  {error}")
+                continue
+            print(format_detail(record, n))
 
 
 # --------------------------------------------------------------------------
@@ -814,7 +997,7 @@ def browse(
 
 def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Lancer l'approche bourrin sur des opérations annotées et l'évaluer"
+        description="Lancer l'extraction en un appel sur des opérations annotées et l'évaluer"
     )
     parser.add_argument(
         "--types",
@@ -877,14 +1060,25 @@ def build_argument_parser() -> argparse.ArgumentParser:
         "--output-dir",
         type=Path,
         default=None,
-        help="dossier des résultats (défaut : artifacts/bourrin_batch/<horodatage>)",
+        help="dossier des résultats (défaut : artifacts/evaluation/<horodatage>)",
     )
     parser.add_argument(
         "--load",
-        type=Path,
         default=None,
-        help="rouvrir un batch enregistré, sans appel LLM",
+        help="rouvrir un batch enregistré, sans appel LLM : dossier local ou URI s3://…",
     )
+    parser.add_argument(
+        "--s3-prefix",
+        default=DEFAULT_S3_PREFIX,
+        help=f"copie des résultats sur S3, sous <préfixe>/<nom du dossier> (défaut : {DEFAULT_S3_PREFIX})",
+    )
+    parser.add_argument("--no-s3", action="store_true", help="ne pas copier les résultats sur S3")
+    parser.add_argument(
+        "--experiment",
+        default=DEFAULT_EXPERIMENT,
+        help=f"expérience MLflow du run (défaut : {DEFAULT_EXPERIMENT}, créée si absente)",
+    )
+    parser.add_argument("--no-mlflow", action="store_true", help="ne pas créer de run MLflow")
     parser.add_argument(
         "--yes", action="store_true", help=f"ne pas demander confirmation au-delà de {CONFIRMATION_THRESHOLD} annonces"
     )
@@ -901,65 +1095,141 @@ def _confirm(count: int) -> bool:
     return answer in {"o", "oui", "y", "yes"}
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    args = build_argument_parser().parse_args(argv)
-    # Une ligne INFO par annonce noierait la progression ; le fichier de log garde tout.
-    console_handler.setLevel(logging.WARNING)
+def batch_s3_uri(prefix: str, output_dir: Path) -> str:
+    """URI S3 d'un batch : le préfixe suivi du nom de son dossier local."""
 
-    if args.load is not None:
-        meta, records = load_batch(args.load)
-        print(f"batch rechargé : {args.load} ({len(records)} annonces)")
-    else:
-        try:
-            types = parse_types(args.types)
-        except ValueError as error:
-            print(error, file=sys.stderr)
-            return 2
-        annotations = load_annotations(args.annotations)
-        sample_size = None if args.all else args.sample_size
-        annonce_ids = select_annonces(
-            annotations, types, sample_size, per_type=args.per_type, seed=args.seed
+    return f"{prefix.rstrip('/')}/{Path(output_dir).name}/"
+
+
+def _load(source: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Batch enregistré, depuis un dossier local ou une URI S3 (téléchargée d'abord)."""
+
+    if not source.startswith("s3://"):
+        return load_batch(source)
+    local_dir = S3_DOWNLOAD_ROOT / source.rstrip("/").rsplit("/", 1)[-1]
+    download_files(source, local_dir, (META_FILE, RESULTS_FILE))
+    print(f"batch téléchargé dans {local_dir}")
+    return load_batch(local_dir)
+
+
+def _run_params(meta: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "approche": meta["approche"],
+        "prompt_version": meta["prompt_version"],
+        "analyse": meta["analyse"],
+        "modele": meta["modele"],
+        "raisonnement": meta["raisonnement"],
+        "types": ",".join(meta["types"]),
+        "sample_size": meta["sample_size"],
+        "per_type": meta["per_type"],
+        "seed": meta["seed"],
+        "workers": meta["workers"],
+        "temperature": meta["ask_options"].get("temperature", "défaut"),
+        "annotations": meta["annotations"],
+        "annonces": len(meta["annonces"]),
+    }
+
+
+def run_new_batch(
+    args: argparse.Namespace,
+) -> tuple[list[dict[str, Any]], pl.DataFrame, str] | int:
+    """Tirer l'échantillon, lancer le batch, copier sur S3 et suivre dans MLflow.
+
+    Renvoie (records, operations, métriques affichables), ou un code de sortie si
+    le batch n'a pas été lancé. S3 et MLflow sont vérifiés avant tout appel LLM.
+    """
+
+    try:
+        types = parse_types(args.types)
+    except ValueError as error:
+        print(error, file=sys.stderr)
+        return 2
+    annotations = load_annotations(args.annotations)
+    sample_size = None if args.all else args.sample_size
+    annonce_ids = select_annonces(
+        annotations, types, sample_size, per_type=args.per_type, seed=args.seed
+    )
+    if not annonce_ids:
+        print("aucune opération annotée pour ces types", file=sys.stderr)
+        return 1
+    output_dir = args.output_dir or OUTPUT_ROOT / datetime.now().strftime(
+        "%Y-%m-%d_%H-%M-%S"
+    )
+    ask_options: dict[str, Any] = {}
+    if args.temperature is not None:
+        ask_options["temperature"] = args.temperature
+    if args.no_reasoning:
+        ask_options["reasoning"] = False
+    sync = (
+        None
+        if args.no_s3
+        else S3Sync(
+            batch_s3_uri(args.s3_prefix, output_dir),
+            output_dir,
+            live_files=(RESULTS_FILE, META_FILE),
         )
-        if not annonce_ids:
-            print("aucune opération annotée pour ces types", file=sys.stderr)
+    )
+    print(
+        f"{len(annonce_ids)} annonce(s) — types {', '.join(types)} — "
+        f"approche {APPROACHES[args.approche]}, "
+        f"prompt {PROMPT_VERSIONS[args.approche]}, "
+        f"analyse {ANALYSIS_MODES[args.analyse]}, modèle {get_model_name()}, "
+        f"raisonnement {reasoning_label(ask_options)}, "
+        f"{args.workers} appel(s) simultané(s)\nrésultats : {output_dir}"
+        + (f"\ncopie S3 : {sync.uri}" if sync else "")
+    )
+    if len(annonce_ids) > CONFIRMATION_THRESHOLD and not args.yes:
+        if not _confirm(len(annonce_ids)):
             return 1
-        output_dir = args.output_dir or OUTPUT_ROOT / datetime.now().strftime(
-            "%Y-%m-%d_%H-%M-%S"
-        )
-        ask_options: dict[str, Any] = {}
-        if args.temperature is not None:
-            ask_options["temperature"] = args.temperature
-        if args.no_reasoning:
-            ask_options["reasoning"] = False
-        print(
-            f"{len(annonce_ids)} annonce(s) — types {', '.join(types)} — "
-            f"approche {APPROACHES[args.approche]}, "
-            f"prompt {PROMPT_VERSIONS[args.approche]}, "
-            f"analyse {ANALYSIS_MODES[args.analyse]}, modèle {get_model_name()}, "
-            f"raisonnement {reasoning_label(ask_options)}, "
-            f"{args.workers} appel(s) simultané(s)\nrésultats : {output_dir}"
-        )
-        if len(annonce_ids) > CONFIRMATION_THRESHOLD and not args.yes:
-            if not _confirm(len(annonce_ids)):
-                return 1
 
-        meta = {
-            "date": datetime.now().isoformat(timespec="seconds"),
-            "approche": args.approche,
-            "prompt_version": PROMPT_VERSIONS[args.approche],
-            "analyse": args.analyse,
-            "modele": get_model_name(),
-            "raisonnement": reasoning_label(ask_options),
-            "annotations": str(args.annotations),
-            "types": list(types),
-            "sample_size": sample_size,
-            "per_type": args.per_type,
-            "seed": args.seed,
-            "workers": args.workers,
-            "ask_options": ask_options,
-            "annonces": annonce_ids,
-        }
+    mlflow = None
+    if not args.no_mlflow:
+        try:
+            mlflow = setup_mlflow(args.experiment)
+        except MlflowCredentialsError as error:
+            print(f"{error}\n(--no-mlflow pour lancer sans run MLflow)", file=sys.stderr)
+            return 2
+
+    meta = {
+        "date": datetime.now().isoformat(timespec="seconds"),
+        "approche": args.approche,
+        "prompt_version": PROMPT_VERSIONS[args.approche],
+        "analyse": args.analyse,
+        "modele": get_model_name(),
+        "raisonnement": reasoning_label(ask_options),
+        "annotations": str(args.annotations),
+        "types": list(types),
+        "sample_size": sample_size,
+        "per_type": args.per_type,
+        "seed": args.seed,
+        "workers": args.workers,
+        "ask_options": ask_options,
+        "s3_uri": sync.uri if sync else None,
+        "langfuse_session": output_dir.name if langfuse_enabled() else None,
+        "annonces": annonce_ids,
+    }
+    write_meta(output_dir, meta)
+    if sync is not None:
+        try:
+            sync.check(META_FILE)
+        except S3SyncError as error:
+            print(f"{error}\n(--no-s3 pour lancer sans copie S3)", file=sys.stderr)
+            return 2
+
+    status = "FAILED"
+    if mlflow is not None:
+        run = mlflow.start_run(run_name=output_dir.name)
+        meta["mlflow_run_id"] = run.info.run_id
         write_meta(output_dir, meta)
+        print(f"run MLflow : {run.info.run_id} (expérience {args.experiment})")
+    try:
+        if mlflow is not None:
+            mlflow.log_params(_run_params(meta))
+            mlflow.set_tag("dossier_local", str(output_dir))
+            if sync is not None:
+                mlflow.set_tag("s3_uri", sync.uri)
+            if meta["langfuse_session"]:
+                mlflow.set_tag("langfuse_session", meta["langfuse_session"])
         started = time.monotonic()
         records = run_batch(
             annonce_ids,
@@ -968,17 +1238,65 @@ def main(argv: Sequence[str] | None = None) -> int:
             analysis=args.analyse,
             workers=args.workers,
             output_dir=output_dir,
+            on_record=sync.maybe_push if sync else None,
+            trace_session=output_dir.name,
             **ask_options,
         )
         meta["duree_totale_s"] = round(time.monotonic() - started, 1)
         meta["annonces_traitees"] = len(records)
         write_meta(output_dir, meta)
 
-    annonces, operations = evaluate(records)
-    if args.load is None:
+        annonces, operations = evaluate(records)
         annonces.write_parquet(output_dir / "annonces.parquet")
         operations.write_parquet(output_dir / "operations.parquet")
-    metrics_text = format_metrics(compute_metrics(annonces, operations), meta)
+        metrics = compute_metrics(annonces, operations)
+        metrics_text = format_metrics(metrics, meta)
+        (output_dir / METRICS_TEXT_FILE).write_text(metrics_text, encoding="utf-8")
+        if sync is not None:
+            if sync.push_all():
+                print(f"résultats copiés sur {sync.uri}")
+            else:
+                print(
+                    f"copie S3 incomplète ; à refaire à la main :\n"
+                    f"  mc cp --recursive {output_dir}/ s3/{sync.bucket}/{sync.prefix}/",
+                    file=sys.stderr,
+                )
+        if mlflow is not None:
+            mlflow.log_metrics(mlflow_metrics(metrics, meta, annonces))
+            mlflow.log_artifact(str(output_dir / METRICS_TEXT_FILE))
+            if sync is not None and sync.failures:
+                mlflow.set_tag("s3_envois_en_echec", sync.failures)
+        status = "FINISHED" if len(records) == len(annonce_ids) else "KILLED"
+    except KeyboardInterrupt:
+        status = "KILLED"
+        raise
+    finally:
+        flush_traces()
+        if mlflow is not None:
+            mlflow.end_run(status=status)
+    return records, operations, metrics_text
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = build_argument_parser().parse_args(argv)
+    # Une ligne INFO par annonce noierait la progression ; le fichier de log garde tout.
+    console_handler.setLevel(logging.WARNING)
+
+    if args.load is not None:
+        try:
+            meta, records = _load(args.load)
+        except S3SyncError as error:
+            print(error, file=sys.stderr)
+            return 2
+        print(f"batch rechargé : {args.load} ({len(records)} annonces)")
+        annonces, operations = evaluate(records)
+        metrics_text = format_metrics(compute_metrics(annonces, operations), meta)
+    else:
+        outcome = run_new_batch(args)
+        if isinstance(outcome, int):
+            return outcome
+        records, operations, metrics_text = outcome
+
     print(metrics_text)
     if args.no_browse:
         return 0

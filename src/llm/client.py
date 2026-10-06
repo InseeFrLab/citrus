@@ -10,11 +10,13 @@ Endpoint and model can be overridden through environment variables so the
 script keeps working if the lab changes its default model:
     - LLM_LAB_API_KEY   : API key (required)
     - LLM_LAB_ENDPOINT  : base url   (default https://llm.lab.sspcloud.fr/api)
-    - LLM_MODEL_NAME    : model name (default gemma4-26b-moe)
+    - LLM_MODEL_NAME    : model name (default qwen3-8-27b)
 """
 
+import contextlib
 import json
 import os
+from typing import Any
 
 from openai import OpenAI
 
@@ -22,19 +24,49 @@ DEFAULT_ENDPOINT = "https://llm.lab.sspcloud.fr/api"
 DEFAULT_MODEL = "qwen3-8-27b"
 
 
-def _client_class() -> type[OpenAI]:
-    """Wrapper Langfuse si les clés sont configurées, client OpenAI sinon.
-
-    Langfuse n'est utilisé que pour le tracing automatique : sans clés il
+def langfuse_enabled() -> bool:
+    """Langfuse n'est utilisé que pour le tracing automatique : sans clés il
     s'initialise, affiche un avertissement puis se désactive. On évite donc
     l'import (~1 s) et le message quand il n'est pas configuré.
     """
 
-    if os.environ.get("LANGFUSE_PUBLIC_KEY") and os.environ.get("LANGFUSE_SECRET_KEY"):
+    return bool(os.environ.get("LANGFUSE_PUBLIC_KEY") and os.environ.get("LANGFUSE_SECRET_KEY"))
+
+
+def _client_class() -> type[OpenAI]:
+    """Wrapper Langfuse si les clés sont configurées, client OpenAI sinon."""
+
+    if langfuse_enabled():
         from langfuse.openai import OpenAI as LangfuseOpenAI
 
         return LangfuseOpenAI
     return OpenAI
+
+
+def trace_attributes(**attributes: Any) -> contextlib.AbstractContextManager:
+    """Étiqueter les traces Langfuse des appels faits dans ce contexte.
+
+    Arguments de `langfuse.propagate_attributes` (session_id, tags, metadata,
+    trace_name…), valeurs US-ASCII de 200 caractères au plus ; les valeurs None
+    sont ignorées. Sans Langfuse configuré, contexte vide.
+    """
+
+    if not langfuse_enabled():
+        return contextlib.nullcontext()
+    from langfuse import propagate_attributes
+
+    return propagate_attributes(
+        **{name: value for name, value in attributes.items() if value is not None}
+    )
+
+
+def flush_traces() -> None:
+    """Envoyer les traces Langfuse en attente (fin de batch)."""
+
+    if langfuse_enabled():
+        from langfuse import get_client as get_langfuse_client
+
+        get_langfuse_client().flush()
 
 
 def get_client() -> OpenAI:

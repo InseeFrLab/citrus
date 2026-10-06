@@ -59,12 +59,18 @@ la **société** (enveloppe juridique immatriculée au RCS) n'est pas son **patr
 Vendre le fonds n'est pas vendre la société.
 
 - **TP — transmission universelle de patrimoine (TUP)** :
-  la société A détient 100 % des titres de B et la dissout ;
+  l'associé unique A (personne morale) décide la **dissolution sans liquidation** de B
+  (article 1844-5 du Code civil) ;
   tout le patrimoine de B, dettes comprises, est transmis en bloc à A.
   B disparaît sans liquidation. Aucune rémunération, aucun échange de titres.
+  C'est une dissolution, pas une fusion : aucun projet de fusion n'est publié.
 - **AB — absorption** :
   l'absorbée disparaît, son patrimoine passe en bloc à une absorbante préexistante.
-  Il reste des associés minoritaires à rémunérer en parts de l'absorbante.
+  Les associés de l'absorbée sont rémunérés en parts de l'absorbante,
+  sauf dans une fusion simplifiée.
+  Une **fusion simplifiée** (article L. 236-11 ou L. 236-3 du Code de commerce),
+  quand l'absorbante, ou une même société mère, détient 100 % des titres,
+  ne donne lieu à aucun échange de titres mais reste une absorption, pas une TP.
   Une détention supérieure à 90 % allège la procédure mais reste une absorption.
 - **FU — fusion par création d'une société nouvelle** :
   plusieurs sociétés disparaissent et fondent leurs patrimoines
@@ -89,7 +95,7 @@ Vendre le fonds n'est pas vendre la société.
 | code | société d'origine | rémunération | ce qui est transféré |
 |------|-------------------|--------------|----------------------|
 | TP | disparaît sans liquidation | aucune (détention 100 %) | patrimoine en bloc, dettes comprises |
-| AB | l'absorbée disparaît | parts de l'absorbante | patrimoine en bloc, dettes comprises |
+| AB | l'absorbée disparaît | parts de l'absorbante (aucune si fusion simplifiée) | patrimoine en bloc, dettes comprises |
 | FU | toutes disparaissent | parts de la société nouvelle | patrimoines en bloc |
 | ST | disparaît, éclatée | parts des bénéficiaires | patrimoine réparti entre plusieurs |
 | SP | survit | parts de la bénéficiaire | une branche d'activité, régime des scissions |
@@ -100,8 +106,11 @@ Vendre le fonds n'est pas vendre la société.
 # §3. Confusions à écarter
 
 - **TP contre AB** :
-  détention à 100 % et aucune rémunération → TP ;
-  minoritaires rémunérés en parts → AB.
+  ce qui les distingue est la procédure, pas le taux de détention.
+  Dissolution sans liquidation décidée par l'associé unique,
+  « transmission universelle de patrimoine », article 1844-5 du Code civil → TP ;
+  projet de fusion, société absorbante et société absorbée → AB,
+  **même** si la détention est de 100 % et qu'aucun titre n'est échangé (fusion simplifiée).
 - **FU contre AB** :
   une société nouvelle naît et aucune société d'origine ne survit → FU ;
   la bénéficiaire existait déjà → AB.
@@ -146,7 +155,9 @@ Rends les montants **en euros**, tels qu'ils figurent dans l'annonce,
 sans séparateur ni décimale :
 la conversion en milliers d'euros est faite ensuite par le programme,
 ne la fais pas toi-même.
-Rends les dates **telles qu'écrites dans l'annonce**, sans les reformater.
+Rends les dates **au format AAAA-MM-JJ** (« 1er janvier 2024 » → `2024-01-01`),
+sans en changer le jour, le mois ou l'année ;
+null si l'annonce ne donne pas de date complète.
 Les raisons sociales sont les dénominations lues dans l'annonce, ou null.
 
 Quand plusieurs sociétés transmettent ou reçoivent

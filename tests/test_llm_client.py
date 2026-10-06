@@ -1,7 +1,11 @@
+import contextlib
+import os
+import sys
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
-from src.llm.client import ask
+from src.llm.client import ask, trace_attributes
 
 
 class FakeClient:
@@ -28,6 +32,25 @@ class AskReasoningTest(unittest.TestCase):
         ask([{"role": "user", "content": "x"}], client=client, reasoning=False)
         self.assertEqual(client.calls[0]["reasoning_effort"], "none")
         self.assertNotIn("reasoning", client.calls[0])
+
+
+class TraceAttributesTest(unittest.TestCase):
+    def test_without_langfuse_keys_is_an_empty_context(self):
+        fake_langfuse = mock.Mock()
+        with mock.patch.dict(os.environ, {}, clear=True), \
+                mock.patch.dict(sys.modules, {"langfuse": fake_langfuse}):
+            self.assertIsInstance(trace_attributes(session_id="s"), contextlib.nullcontext)
+        fake_langfuse.propagate_attributes.assert_not_called()
+
+    def test_with_langfuse_keys_propagates_non_null_attributes(self):
+        fake_langfuse = mock.Mock()
+        keys = {"LANGFUSE_PUBLIC_KEY": "pk", "LANGFUSE_SECRET_KEY": "sk"}
+        with mock.patch.dict(os.environ, keys, clear=True), \
+                mock.patch.dict(sys.modules, {"langfuse": fake_langfuse}):
+            trace_attributes(session_id=None, tags=["metier"], metadata={"annonce_id": "A1"})
+        fake_langfuse.propagate_attributes.assert_called_once_with(
+            tags=["metier"], metadata={"annonce_id": "A1"}
+        )
 
 
 if __name__ == "__main__":
