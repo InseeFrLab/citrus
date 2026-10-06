@@ -10,8 +10,14 @@ dependencies = [
     "dotenv>=0.9.9",
     "langfuse>=4.13.2",
     "logging>=0.4.9.6",
+    "mlflow>=3.16.1",
     "openai>=2.44.0",
     "polars>=1.42.1",
     "requests>=2.34.2",
     "unidecode>=1.4.0",
+]
+
+[dependency-groups]
+dev = [
+    "ipykernel>=7.3.0",
 ]

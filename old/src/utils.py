@@ -1,3 +1,5 @@
+import polars as pl
+
 def annuaire(siren_siret: str):
     return f"https://annuaire-entreprises.data.gouv.fr/entreprise/{siren_siret}"
 
@@ -22,3 +24,8 @@ def luhn_checksum(sirene_number):
 def is_luhn_valid(sirene_number):
     return luhn_checksum(sirene_number) == 0
 
+
+def parse_to_date_df(df, col_to_parse="dateEffetComptable", format="%d-%m-%Y"):
+    return df.with_columns(
+        pl.col(col_to_parse).str.strip_chars().str.to_date(format, strict=False)
+    )

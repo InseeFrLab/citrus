@@ -1,8 +1,16 @@
 # Docs
 *.gv
 
+# Quarto render
+*_files/
+.quarto/
+_site/
+_freeze/
+docs/*.html
+
 # Data
 data/
+artifacts/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -222,3 +230,4 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+operations_verifiees.parquet

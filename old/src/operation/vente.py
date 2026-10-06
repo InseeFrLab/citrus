@@ -1,7 +1,11 @@
+from decimal import Decimal, ROUND_HALF_UP
+from typing import Any
+
 from src.llm.prompt import _build_prompt_llm_amount, _build_prompt_llm_date_comptable
 from src.llm.client import ask_json
 from src import logger
 from src.bodacc.api import _clean_json, _get_rs, _get_siren, _get_annee_annonce
+from src.operation.base import OperationResult
 
 
 def _build_prompt_llm_vente_amount(text_a_extraire) -> list[dict]:
@@ -92,3 +96,30 @@ def parse_vente(json_dict):
         "typeOperation": "VE",
         "source": json_dict["url_complete"]
     }
+
+
+def _eur_to_integer_keur(amount: Any) -> int:
+    """Apply the legacy evaluator's half-away-from-zero EUR to kEUR conversion."""
+    return int((Decimal(str(amount)) / Decimal(1000)).quantize(
+        Decimal("1"), rounding=ROUND_HALF_UP
+    ))
+
+
+class VenteSkill:
+    """Canonical VE extraction entry point, backed by the legacy helpers."""
+
+    operation_type = "VE"
+
+    def extract(self, announcement: dict[str, Any]) -> OperationResult:
+        parsed = parse_vente(announcement)
+        amount = extract_amount_vente(announcement).get("montantNet")
+        return {
+            **parsed,
+            "dateRealisationJuridique": None,
+            "montantNet": (
+                _eur_to_integer_keur(amount) if amount is not None else None
+            ),
+        }
+
+
+vente_skill = VenteSkill()
